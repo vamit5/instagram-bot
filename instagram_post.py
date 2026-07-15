@@ -116,6 +116,11 @@ def main():
     ig_user_id = os.environ["IG_ACCOUNT_ID"]
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
 
+    print(f"DEBUG - duzina tokena: {len(access_token)}")
+    print(f"DEBUG - pocinje sa 'IGAA': {access_token.startswith('IGAA')}")
+    print(f"DEBUG - ima razmaka: {' ' in access_token}")
+    print(f"DEBUG - IG Account ID: {ig_user_id}")
+
     drive = get_drive_service()
     videos = list_videos(drive, folder_id)
 
