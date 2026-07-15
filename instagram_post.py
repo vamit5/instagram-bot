@@ -13,7 +13,7 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 STATE_FILE = "state.json"
 GRAPH_VERSION = "v21.0"
 
