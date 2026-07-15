@@ -1,7 +1,8 @@
 """
 Skripta koja automatski objavljuje sledeci video (reel) sa Google Drive foldera
-na Instagram, u krug (rotation). Cuva u state.json koji je video poslednji
-objavljen, tako da svaki sledeci pokretanje objavi SLEDECI video na listi.
+na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
+- gornji deo: nasumicno izabrana poruka sa liste
+- donji deo: fiksna cena/poruka
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -9,14 +10,34 @@ Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 import os
 import json
 import time
+import random
+import subprocess
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 STATE_FILE = "state.json"
 GRAPH_VERSION = "v21.0"
 API_BASE = "https://graph.instagram.com"
+
+PROCESSED_FOLDER_NAME = "_objavljeno_sa_tekstom"
+
+IG_CAPTION = (
+    "Napravi haos u drustvu sa #vamit5sat - Samo 19e danas! "
+    "Link ka Online Shopu je u opisu profila."
+)
+
+BOTTOM_TEXT = "Danas samo 19e"
+
+TOP_TEXTS = [
+    "Napravi haos u drustvu",
+    "Da li mozes pobediti VAMIT-5 sat",
+    "99% ljudi ne uspe VAMIT-5 sat do kraja",
+]
+
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
 def get_drive_service():
@@ -29,9 +50,12 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
-    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja
-    (najstariji prvi), tako da je redosled objavljivanja predvidiv."""
-    query = f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
+    """Vraca listu originalnih video fajlova direktno u glavnom folderu
+    (fajlovi sa dodatim tekstom se cuvaju u posebnom podfolderu i ne
+    pojavljuju se ovde), sortirano po datumu dodavanja."""
+    query = (
+        f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
+    )
     results = (
         service.files()
         .list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime")
@@ -40,9 +64,48 @@ def list_videos(service, folder_id):
     return results.get("files", [])
 
 
+def get_or_create_processed_folder(service, parent_id):
+    query = (
+        f"'{parent_id}' in parents and name='{PROCESSED_FOLDER_NAME}' "
+        f"and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": PROCESSED_FOLDER_NAME,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=metadata, fields="id").execute()
+    return folder["id"]
+
+
+def download_file(service, file_id, local_path):
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"Preuzimanje: {int(status.progress() * 100)}%")
+
+
+def upload_file(service, local_path, name, parent_id):
+    metadata = {"name": name, "parents": [parent_id]}
+    media = MediaFileUpload(local_path, resumable=True)
+    file = (
+        service.files()
+        .create(body=metadata, media_body=media, fields="id")
+        .execute()
+    )
+    return file["id"]
+
+
 def make_public(service, file_id):
-    """Instagram mora da moze da 'skine' video preko javnog linka, pa fajl
-    privremeno postavljamo na 'bilo ko sa linkom moze da gleda'."""
     try:
         service.permissions().create(
             fileId=file_id, body={"type": "anyone", "role": "reader"}
@@ -53,6 +116,79 @@ def make_public(service, file_id):
 
 def get_direct_url(file_id):
     return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+def get_video_dimensions(local_path):
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            local_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    stream = data["streams"][0]
+    return stream["width"], stream["height"]
+
+
+def escape_ffmpeg_text(text):
+    return (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+    )
+
+
+def compute_fontsize(text, width):
+    size = int(width / (max(len(text), 10) * 0.62))
+    return max(34, min(70, size))
+
+
+def add_text_overlay(local_in, local_out, width, height):
+    top_text = random.choice(TOP_TEXTS)
+    bottom_text = BOTTOM_TEXT
+
+    top_size = compute_fontsize(top_text, width)
+    bottom_size = compute_fontsize(bottom_text, width)
+
+    top_escaped = escape_ffmpeg_text(top_text)
+    bottom_escaped = escape_ffmpeg_text(bottom_text)
+
+    top_y = int(height * 0.06)
+    bottom_y = int(height * 0.78)
+
+    drawtext_top = (
+        f"drawtext=fontfile={FONT_PATH}:text='{top_escaped}':"
+        f"fontsize={top_size}:fontcolor=white:"
+        f"x=(w-text_w)/2:y={top_y}:"
+        f"box=1:boxcolor=black@0.55:boxborderw=20"
+    )
+    drawtext_bottom = (
+        f"drawtext=fontfile={FONT_PATH}:text='{bottom_escaped}':"
+        f"fontsize={bottom_size}:fontcolor=white:"
+        f"x=(w-text_w)/2:y={bottom_y}:"
+        f"box=1:boxcolor=black@0.55:boxborderw=20"
+    )
+
+    filter_chain = f"{drawtext_top},{drawtext_bottom}"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", local_in,
+        "-vf", filter_chain,
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-c:a", "copy",
+        local_out,
+    ]
+    print("Pokrecem ffmpeg:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
 def load_state():
@@ -83,8 +219,6 @@ def create_media_container(ig_user_id, access_token, video_url, caption=""):
 
 
 def wait_for_container(container_id, access_token, timeout=600):
-    """Instagram treba vremena da obradi video pre objave -- proveravamo
-    na svakih 10 sekundi da li je gotovo (status FINISHED)."""
     url = f"{API_BASE}/{GRAPH_VERSION}/{container_id}"
     start = time.time()
     while time.time() - start < timeout:
@@ -128,12 +262,23 @@ def main():
     next_index = (state["last_index"] + 1) % len(videos)
     video = videos[next_index]
 
-    print(f"Redosled: {next_index + 1}/{len(videos)} -- objavljujem: {video['name']}")
+    print(f"Redosled: {next_index + 1}/{len(videos)} -- obradjujem: {video['name']}")
 
-    make_public(drive, video["id"])
-    video_url = get_direct_url(video["id"])
+    local_in = "original.mp4"
+    local_out = "sa_tekstom.mp4"
 
-    container_id = create_media_container(ig_user_id, access_token, video_url)
+    download_file(drive, video["id"], local_in)
+    width, height = get_video_dimensions(local_in)
+    add_text_overlay(local_in, local_out, width, height)
+
+    processed_folder_id = get_or_create_processed_folder(drive, folder_id)
+    processed_file_id = upload_file(
+        drive, local_out, f"objavljeno_{video['name']}", processed_folder_id
+    )
+    make_public(drive, processed_file_id)
+    video_url = get_direct_url(processed_file_id)
+
+    container_id = create_media_container(ig_user_id, access_token, video_url, IG_CAPTION)
     wait_for_container(container_id, access_token)
     result = publish_container(ig_user_id, access_token, container_id)
 
