@@ -1,0 +1,46 @@
+name: Objavi Instagram Reel
+
+# Vremena su u UTC. Za Srbiju (leti CEST = UTC+2, zimi CET = UTC+1).
+# Ovi termini (7,10,13,16,19 UTC) odgovaraju otprilike 9,12,15,18,21h
+# po srpskom letnjem vremenu. Slobodno izmeni brojeve po zelji.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 13 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 19 * * *"
+  workflow_dispatch: {}  # dozvoljava i rucno pokretanje sa GitHub sajta, za testiranje
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Preuzmi repozitorijum
+        uses: actions/checkout@v4
+
+      - name: Podesi Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instaliraj biblioteke
+        run: pip install -r requirements.txt
+
+      - name: Objavi sledeci video
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_ACCOUNT_ID: ${{ secrets.IG_ACCOUNT_ID }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: python instagram_post.py
+
+      - name: Sacuvaj napredak (state.json)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update posting state [skip ci]" || echo "Nema promena"
+          git push
