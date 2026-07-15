@@ -4,6 +4,9 @@ na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
 - gornji deo: nasumicno izabrana poruka sa liste
 - donji deo: fiksna cena/poruka
 
+Obradjeni video se privremeno otprema na Cloudinary (besplatan servis za
+hostovanje), jer Instagram zahteva javni link do videa da bi ga objavio.
+
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
 
@@ -15,14 +18,15 @@ import subprocess
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 STATE_FILE = "state.json"
 GRAPH_VERSION = "v21.0"
 API_BASE = "https://graph.instagram.com"
 
-PROCESSED_FOLDER_NAME = "_objavljeno_sa_tekstom"
+CLOUDINARY_CLOUD_NAME = "dnbjvccgy"
+CLOUDINARY_UPLOAD_PRESET = "instagram_bot"
 
 IG_CAPTION = (
     "Napravi haos u drustvu sa #vamit5sat - Samo 19e danas! "
@@ -50,9 +54,8 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
-    """Vraca listu originalnih video fajlova direktno u glavnom folderu
-    (fajlovi sa dodatim tekstom se cuvaju u posebnom podfolderu i ne
-    pojavljuju se ovde), sortirano po datumu dodavanja."""
+    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja
+    (najstariji prvi), tako da je redosled objavljivanja predvidiv."""
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
@@ -64,25 +67,6 @@ def list_videos(service, folder_id):
     return results.get("files", [])
 
 
-def get_or_create_processed_folder(service, parent_id):
-    query = (
-        f"'{parent_id}' in parents and name='{PROCESSED_FOLDER_NAME}' "
-        f"and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    metadata = {
-        "name": PROCESSED_FOLDER_NAME,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    folder = service.files().create(body=metadata, fields="id").execute()
-    return folder["id"]
-
-
 def download_file(service, file_id, local_path):
     request = service.files().get_media(fileId=file_id)
     with open(local_path, "wb") as f:
@@ -92,30 +76,6 @@ def download_file(service, file_id, local_path):
             status, done = downloader.next_chunk()
             if status:
                 print(f"Preuzimanje: {int(status.progress() * 100)}%")
-
-
-def upload_file(service, local_path, name, parent_id):
-    metadata = {"name": name, "parents": [parent_id]}
-    media = MediaFileUpload(local_path, resumable=True)
-    file = (
-        service.files()
-        .create(body=metadata, media_body=media, fields="id")
-        .execute()
-    )
-    return file["id"]
-
-
-def make_public(service, file_id):
-    try:
-        service.permissions().create(
-            fileId=file_id, body={"type": "anyone", "role": "reader"}
-        ).execute()
-    except Exception as e:
-        print(f"Upozorenje pri postavljanju dozvole: {e}")
-
-
-def get_direct_url(file_id):
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def get_video_dimensions(local_path):
@@ -189,6 +149,18 @@ def add_text_overlay(local_in, local_out, width, height):
     ]
     print("Pokrecem ffmpeg:", " ".join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def upload_to_cloudinary(local_path):
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
+    with open(local_path, "rb") as f:
+        files = {"file": f}
+        data = {"upload_preset": CLOUDINARY_UPLOAD_PRESET}
+        r = requests.post(url, files=files, data=data, timeout=300)
+    if not r.ok:
+        print("Greska pri otpremanju na Cloudinary:", r.text)
+    r.raise_for_status()
+    return r.json()["secure_url"]
 
 
 def load_state():
@@ -271,12 +243,8 @@ def main():
     width, height = get_video_dimensions(local_in)
     add_text_overlay(local_in, local_out, width, height)
 
-    processed_folder_id = get_or_create_processed_folder(drive, folder_id)
-    processed_file_id = upload_file(
-        drive, local_out, f"objavljeno_{video['name']}", processed_folder_id
-    )
-    make_public(drive, processed_file_id)
-    video_url = get_direct_url(processed_file_id)
+    video_url = upload_to_cloudinary(local_out)
+    print(f"Video otpremljen na: {video_url}")
 
     container_id = create_media_container(ig_user_id, access_token, video_url, IG_CAPTION)
     wait_for_container(container_id, access_token)
