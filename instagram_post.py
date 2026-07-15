@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 STATE_FILE = "state.json"
 GRAPH_VERSION = "v21.0"
+API_BASE = "https://graph.instagram.com"
 
 
 def get_drive_service():
@@ -67,7 +68,7 @@ def save_state(state):
 
 
 def create_media_container(ig_user_id, access_token, video_url, caption=""):
-    url = f"https://graph.facebook.com/{GRAPH_VERSION}/{ig_user_id}/media"
+    url = f"{API_BASE}/{GRAPH_VERSION}/{ig_user_id}/media"
     payload = {
         "media_type": "REELS",
         "video_url": video_url,
@@ -84,7 +85,7 @@ def create_media_container(ig_user_id, access_token, video_url, caption=""):
 def wait_for_container(container_id, access_token, timeout=600):
     """Instagram treba vremena da obradi video pre objave -- proveravamo
     na svakih 10 sekundi da li je gotovo (status FINISHED)."""
-    url = f"https://graph.facebook.com/{GRAPH_VERSION}/{container_id}"
+    url = f"{API_BASE}/{GRAPH_VERSION}/{container_id}"
     start = time.time()
     while time.time() - start < timeout:
         r = requests.get(
@@ -102,7 +103,7 @@ def wait_for_container(container_id, access_token, timeout=600):
 
 
 def publish_container(ig_user_id, access_token, container_id):
-    url = f"https://graph.facebook.com/{GRAPH_VERSION}/{ig_user_id}/media_publish"
+    url = f"{API_BASE}/{GRAPH_VERSION}/{ig_user_id}/media_publish"
     payload = {"creation_id": container_id, "access_token": access_token}
     r = requests.post(url, data=payload, timeout=60)
     if not r.ok:
@@ -115,11 +116,6 @@ def main():
     access_token = os.environ["IG_ACCESS_TOKEN"]
     ig_user_id = os.environ["IG_ACCOUNT_ID"]
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
-
-    print(f"DEBUG - duzina tokena: {len(access_token)}")
-    print(f"DEBUG - pocinje sa 'IGAA': {access_token.startswith('IGAA')}")
-    print(f"DEBUG - ima razmaka: {' ' in access_token}")
-    print(f"DEBUG - IG Account ID: {ig_user_id}")
 
     drive = get_drive_service()
     videos = list_videos(drive, folder_id)
