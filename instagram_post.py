@@ -43,6 +43,10 @@ TOP_TEXTS = [
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Pozicije teksta kao procenat visine videa (0 = vrh, 1 = dno)
+TOP_TEXT_Y_FRACTION = 0.14
+BOTTOM_TEXT_Y_FRACTION = 0.80
+
 
 def get_drive_service():
     creds_json = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
@@ -79,12 +83,16 @@ def download_file(service, file_id, local_path):
 
 
 def get_video_dimensions(local_path):
+    """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
+    rotacione metapodatke koje telefoni cesto upisuju (video snimljen
+    'uspravno' moze biti sacuvan sa sirinom/visinom obrnutim, plus oznakom
+    da ga treba rotirati pri prikazu)."""
     result = subprocess.run(
         [
             "ffprobe",
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
+            "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
             "-of", "json",
             local_path,
         ],
@@ -94,7 +102,22 @@ def get_video_dimensions(local_path):
     )
     data = json.loads(result.stdout)
     stream = data["streams"][0]
-    return stream["width"], stream["height"]
+    width = stream["width"]
+    height = stream["height"]
+
+    rotation = 0
+    tags = stream.get("tags", {})
+    if "rotate" in tags:
+        rotation = int(tags["rotate"])
+    for sd in stream.get("side_data_list", []):
+        if "rotation" in sd:
+            rotation = int(sd["rotation"])
+
+    rotation = rotation % 360
+    if rotation in (90, 270):
+        width, height = height, width
+
+    return width, height
 
 
 def escape_ffmpeg_text(text):
@@ -107,8 +130,8 @@ def escape_ffmpeg_text(text):
 
 
 def compute_fontsize(text, width):
-    size = int(width / (max(len(text), 10) * 0.62))
-    return max(34, min(70, size))
+    size = int(width / (max(len(text), 10) * 0.5))
+    return max(40, min(90, size))
 
 
 def add_text_overlay(local_in, local_out, width, height):
@@ -121,8 +144,8 @@ def add_text_overlay(local_in, local_out, width, height):
     top_escaped = escape_ffmpeg_text(top_text)
     bottom_escaped = escape_ffmpeg_text(bottom_text)
 
-    top_y = int(height * 0.06)
-    bottom_y = int(height * 0.78)
+    top_y = int(height * TOP_TEXT_Y_FRACTION)
+    bottom_y = int(height * BOTTOM_TEXT_Y_FRACTION)
 
     drawtext_top = (
         f"drawtext=fontfile={FONT_PATH}:text='{top_escaped}':"
@@ -241,6 +264,7 @@ def main():
 
     download_file(drive, video["id"], local_in)
     width, height = get_video_dimensions(local_in)
+    print(f"Dimenzije videa (posle rotacije): {width}x{height}")
     add_text_overlay(local_in, local_out, width, height)
 
     video_url = upload_to_cloudinary(local_out)
