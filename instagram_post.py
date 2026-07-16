@@ -160,7 +160,7 @@ def escape_ffmpeg_text(text):
         .replace("'", "\\'")
         .replace(",", "\\,")
     )
-    def wrap_by_pixel_width(text, font, max_width_px):
+def wrap_by_pixel_width(text, font, max_width_px):
     words = text.split()
     lines = []
     current = ""
