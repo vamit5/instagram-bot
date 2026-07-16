@@ -197,6 +197,10 @@ def wrap_tokens(tokens, font, fontsize, max_width_px):
         lines.append(current)
     return lines
     def fit_tokens(text, video_width, max_lines):
+    
+    
+    
+    
     max_width_px = int(video_width * MAX_TEXT_WIDTH_FRACTION) - (2 * BOX_BORDER)
     max_width_px = max(max_width_px, 50)
     tokens = tokenize(text)
