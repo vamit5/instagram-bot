@@ -1,3 +1,24 @@
 {
-  "last_index": 23
+  "last_index": 24,
+  "top_queue": [
+    9,
+    6,
+    3,
+    7,
+    11,
+    1,
+    8,
+    10,
+    4,
+    5,
+    2
+  ],
+  "top_last": 0,
+  "bottom_queue": [
+    1,
+    2,
+    4,
+    3
+  ],
+  "bottom_last": 0
 }
