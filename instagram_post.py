@@ -24,6 +24,14 @@ Gornji i donji tekst se biraju iz "rotirajuce" liste -- isti tekst se NIKAD
 ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
 rotacije se cuva u state.json).
 
+Fajlovi cije ime sadrzi rec "prioritet" se tretiraju kao viralni klipovi:
+pojavljuju se cesce (svaka treca objava je "bonus" prioritetni klip) i na
+njih se NIKAD ne stavlja tekst preko videa.
+
+Svi mrezni pozivi (Google Drive, Cloudinary, Instagram API) automatski
+pokusavaju ponovo (uz sve duzu pauzu) ako naidju na privremenu gresku, pre
+nego sto stvarno odustanu.
+
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
 
@@ -95,6 +103,35 @@ RULE_TEXT = (
     "grudi do dole, ruke se ispružaju maksimalno, nedozvoljeno je ići na kolena."
 )
 
+# Fajlovi cije ime sadrzi ovu rec (bilo gde, velika/mala slova nebitno) se
+# tretiraju kao "prioritetni" (viralni) klipovi: (1) svaka PRIORITY_BOOST_EVERY-ta
+# objava je "bonus" -- preskace se normalan redosled i ubaci se prioritetan
+# klip (rotirajuci i medju njima), i (2) na te klipove se NIKAD ne stavlja
+# tekst preko videa (samo opis ispod objave ostaje normalan).
+PRIORITY_PATTERN = re.compile(r"prioritet", re.IGNORECASE)
+PRIORITY_BOOST_EVERY = 3
+
+# Koliko puta da se pokusa ponovo (uz pauzu koja se svaki put duplira) pre
+# nego sto se stvarno odustane od mreznog poziva -- ovo pokriva velecinu
+# povremenih, prolaznih gresaka (Drive, Cloudinary, Instagram API).
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 5
+
+
+def with_retry(func, *args, retries=RETRY_ATTEMPTS, delay=RETRY_BASE_DELAY, **kwargs):
+    attempt = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            attempt += 1
+            if attempt >= retries:
+                print(f"Odustajem posle {attempt} pokusaja: {e}")
+                raise
+            wait = delay * (2 ** (attempt - 1))
+            print(f"Greska ({e}) -- pokusaj {attempt}/{retries}, cekam {wait}s...")
+            time.sleep(wait)
+
 
 def get_drive_service():
     creds_json = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
@@ -111,60 +148,73 @@ def list_videos(service, folder_id):
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
-    results = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, createdTime, videoMediaMetadata(durationMillis))",
-            orderBy="createdTime",
+
+    def call():
+        return (
+            service.files()
+            .list(
+                q=query,
+                fields="files(id, name, createdTime, videoMediaMetadata(durationMillis))",
+                orderBy="createdTime",
+            )
+            .execute()
         )
-        .execute()
-    )
+
+    results = with_retry(call)
     return results.get("files", [])
 
 
 def download_file(service, file_id, local_path):
-    request = service.files().get_media(fileId=file_id)
-    with open(local_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                print(f"Preuzimanje: {int(status.progress() * 100)}%")
+    def call():
+        request = service.files().get_media(fileId=file_id)
+        with open(local_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk(num_retries=RETRY_ATTEMPTS)
+                if status:
+                    print(f"Preuzimanje: {int(status.progress() * 100)}%")
+
+    with_retry(call)
 
 
 def get_duration_via_ffprobe(local_path):
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            local_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    data = json.loads(result.stdout)
-    return float(data["format"]["duration"])
+    def call():
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "json",
+                local_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(result.stdout)
+        return float(data["format"]["duration"])
+
+    return with_retry(call, retries=2, delay=2)
 
 
 def has_audio_stream(local_path):
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index",
-            "-of", "json",
-            local_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    data = json.loads(result.stdout)
-    return len(data.get("streams", [])) > 0
+    def call():
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "json",
+                local_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(result.stdout)
+        return len(data.get("streams", [])) > 0
+
+    return with_retry(call, retries=2, delay=2)
 
 
 def ensure_durations(drive, videos):
@@ -193,9 +243,12 @@ def ensure_durations(drive, videos):
 
 def build_playlist(videos):
     """Pravi listu 'jedinica za objavu'. Video kraci od SHORT_CLIP_THRESHOLD
-    sekundi se spaja sa sledecim kratkim klipovima (istim redosledom kojim
-    su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi. Duzi
-    klipovi se objavljuju pojedinacno, nepromenjeni."""
+    sekundi se sakuplja u zajednicku 'korpu' -- BEZ OBZIRA da li se izmedju
+    kratkih klipova nalaze duzi videi (duzi videi se odmah dodaju u listu
+    pojedinacno, ali ne prekidaju sakupljanje kratkih klipova u pozadini).
+    Cim zbir kratkih klipova dostigne MIN_COMBINED_DURATION sekundi, oni se
+    spajaju u jednu objavu. Ovo garantuje da kratak klip NIKAD ne ostane
+    usamljen samo zato sto je izmedju dva duga videa na Drive-u."""
     playlist = []
     buffer = []
     buffer_duration = 0.0
@@ -210,7 +263,6 @@ def build_playlist(videos):
     for video in videos:
         duration = video.get("_duration")
         if duration is None or duration >= SHORT_CLIP_THRESHOLD:
-            flush()
             playlist.append([video])
         else:
             buffer.append(video)
@@ -224,37 +276,39 @@ def build_playlist(videos):
 def get_video_dimensions(local_path):
     """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
     rotacione metapodatke koje telefoni cesto upisuju."""
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
-            "-of", "json",
-            local_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    data = json.loads(result.stdout)
-    stream = data["streams"][0]
-    width = stream["width"]
-    height = stream["height"]
+    def call():
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+                "-of", "json",
+                local_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        width = stream["width"]
+        height = stream["height"]
 
-    rotation = 0
-    tags = stream.get("tags", {})
-    if "rotate" in tags:
-        rotation = int(tags["rotate"])
-    for sd in stream.get("side_data_list", []):
-        if "rotation" in sd:
-            rotation = int(sd["rotation"])
+        rotation = 0
+        tags = stream.get("tags", {})
+        if "rotate" in tags:
+            rotation = int(tags["rotate"])
+        for sd in stream.get("side_data_list", []):
+            if "rotation" in sd:
+                rotation = int(sd["rotation"])
 
-    rotation = rotation % 360
-    if rotation in (90, 270):
-        width, height = height, width
+        rotation = rotation % 360
+        if rotation in (90, 270):
+            return height, width
+        return width, height
 
-    return width, height
+    return with_retry(call, retries=2, delay=2)
 
 
 def get_local_path(drive, video, target_path):
@@ -321,7 +375,7 @@ def concatenate_clips(local_paths, durations, output_path):
         output_path,
     ]
     print("Spajam klipove (sa zvukom):", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    with_retry(subprocess.run, cmd, retries=2, delay=3, check=True)
 
 
 EMOJI_PATTERN = re.compile(
@@ -418,12 +472,16 @@ def get_emoji_image(char, size, cache):
     url = TWEMOJI_BASE + codepoint + ".png"
     img = None
     try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        def fetch():
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            return r.content
+
+        content = with_retry(fetch, retries=3, delay=3)
+        img = Image.open(io.BytesIO(content)).convert("RGBA")
         img = img.resize((size, size), Image.LANCZOS)
     except Exception as e:
-        print(f"Ne mogu da preuzmem emoji ({char}): {e}")
+        print(f"Ne mogu da preuzmem emoji ({char}) posle vise pokusaja: {e} -- preskacem ga.")
     cache[key] = img
     return img
 
@@ -497,7 +555,7 @@ def add_text_overlay(local_in, local_out, width, height, top_original, bottom_or
         local_out,
     ]
     print("Pokrecem ffmpeg:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    with_retry(subprocess.run, cmd, retries=2, delay=3, check=True)
 
 
 def build_caption(top_original, bottom_original):
@@ -512,14 +570,18 @@ def build_caption(top_original, bottom_original):
 
 def upload_to_cloudinary(local_path):
     url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
-    with open(local_path, "rb") as f:
-        files = {"file": f}
-        data = {"upload_preset": CLOUDINARY_UPLOAD_PRESET}
-        r = requests.post(url, files=files, data=data, timeout=300)
-    if not r.ok:
-        print("Greska pri otpremanju na Cloudinary:", r.text)
-    r.raise_for_status()
-    return r.json()["secure_url"]
+
+    def call():
+        with open(local_path, "rb") as f:
+            files = {"file": f}
+            data = {"upload_preset": CLOUDINARY_UPLOAD_PRESET}
+            r = requests.post(url, files=files, data=data, timeout=300)
+        if not r.ok:
+            print("Greska pri otpremanju na Cloudinary:", r.text)
+        r.raise_for_status()
+        return r.json()["secure_url"]
+
+    return with_retry(call)
 
 
 def load_state():
@@ -565,22 +627,31 @@ def create_media_container(ig_user_id, access_token, video_url, caption=""):
         "caption": caption,
         "access_token": access_token,
     }
-    r = requests.post(url, data=payload, timeout=60)
-    if not r.ok:
-        print("Greska pri kreiranju medija:", r.text)
-    r.raise_for_status()
-    return r.json()["id"]
+
+    def call():
+        r = requests.post(url, data=payload, timeout=60)
+        if not r.ok:
+            print("Greska pri kreiranju medija:", r.text)
+        r.raise_for_status()
+        return r.json()["id"]
+
+    return with_retry(call)
 
 
 def wait_for_container(container_id, access_token, timeout=600):
     url = f"{API_BASE}/{GRAPH_VERSION}/{container_id}"
     start = time.time()
     while time.time() - start < timeout:
-        r = requests.get(
-            url, params={"fields": "status_code", "access_token": access_token}, timeout=30
-        )
-        r.raise_for_status()
-        status = r.json().get("status_code")
+        try:
+            r = requests.get(
+                url, params={"fields": "status_code", "access_token": access_token}, timeout=30
+            )
+            r.raise_for_status()
+            status = r.json().get("status_code")
+        except Exception as e:
+            print(f"Privremena greska pri proveri statusa ({e}), pokusavam ponovo...")
+            time.sleep(10)
+            continue
         print(f"Status obrade: {status}")
         if status == "FINISHED":
             return True
@@ -593,11 +664,19 @@ def wait_for_container(container_id, access_token, timeout=600):
 def publish_container(ig_user_id, access_token, container_id):
     url = f"{API_BASE}/{GRAPH_VERSION}/{ig_user_id}/media_publish"
     payload = {"creation_id": container_id, "access_token": access_token}
-    r = requests.post(url, data=payload, timeout=60)
-    if not r.ok:
-        print("Greska pri objavljivanju:", r.text)
-    r.raise_for_status()
-    return r.json()
+
+    def call():
+        r = requests.post(url, data=payload, timeout=60)
+        if not r.ok:
+            print("Greska pri objavljivanju:", r.text)
+        r.raise_for_status()
+        return r.json()
+
+    return with_retry(call)
+
+
+def is_priority_unit(unit):
+    return any(PRIORITY_PATTERN.search(video["name"]) for video in unit)
 
 
 def main():
@@ -614,17 +693,31 @@ def main():
 
     ensure_durations(drive, videos)
     playlist = build_playlist(videos)
+    priority_units = [u for u in playlist if is_priority_unit(u)]
 
     state = load_state()
-    next_index = (state["last_index"] + 1) % len(playlist)
-    unit = playlist[next_index]
+    run_counter = state.get("run_counter", 0) + 1
+    state["run_counter"] = run_counter
 
-    print(f"Redosled: {next_index + 1}/{len(playlist)} -- fajlova u ovoj objavi: {len(unit)}")
+    advance_main_index = True
+
+    if priority_units and run_counter % PRIORITY_BOOST_EVERY == 0:
+        p_idx = (state.get("priority_index", -1) + 1) % len(priority_units)
+        state["priority_index"] = p_idx
+        unit = priority_units[p_idx]
+        advance_main_index = False
+        print(f"BONUS prioritetna objava ({p_idx + 1}/{len(priority_units)}): {[v['name'] for v in unit]}")
+    else:
+        next_index = (state["last_index"] + 1) % len(playlist)
+        unit = playlist[next_index]
+        print(f"Redosled: {next_index + 1}/{len(playlist)} -- fajlova u ovoj objavi: {len(unit)}")
 
     top_original = pick_next_text(state, "top", TOP_TEXTS)
     bottom_original = pick_next_text(state, "bottom", BOTTOM_TEXTS)
 
-    local_out = "sa_tekstom.mp4"
+    priority = is_priority_unit(unit)
+    if priority:
+        print("Ovo je prioritetan klip -- BEZ teksta na videu (samo opis ispod objave).")
 
     if len(unit) == 1:
         local_in = "original.mp4"
@@ -641,11 +734,16 @@ def main():
         concatenate_clips(clip_paths, durations, local_in)
         print(f"Spojeno {len(unit)} kratkih klipova u jedan video: {[v['name'] for v in unit]}")
 
-    width, height = get_video_dimensions(local_in)
-    print(f"Dimenzije videa (posle rotacije): {width}x{height}")
-    add_text_overlay(local_in, local_out, width, height, top_original, bottom_original)
+    if priority:
+        video_to_upload = local_in
+    else:
+        local_out = "sa_tekstom.mp4"
+        width, height = get_video_dimensions(local_in)
+        print(f"Dimenzije videa (posle rotacije): {width}x{height}")
+        add_text_overlay(local_in, local_out, width, height, top_original, bottom_original)
+        video_to_upload = local_out
 
-    video_url = upload_to_cloudinary(local_out)
+    video_url = upload_to_cloudinary(video_to_upload)
     print(f"Video otpremljen na: {video_url}")
 
     caption = build_caption(top_original, bottom_original)
@@ -656,7 +754,8 @@ def main():
 
     print(f"Uspesno objavljeno! Media ID: {result.get('id')}")
 
-    state["last_index"] = next_index
+    if advance_main_index:
+        state["last_index"] = next_index
     save_state(state)
 
 
