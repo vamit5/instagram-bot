@@ -1,10 +1,15 @@
 """
 Skripta koja automatski objavljuje sledeci video (reel) sa Google Drive foldera
-na Instagram, u krug (rotation). Pre objave, na video dodaje tekst SA PRAVIM
-emoji slicicama (preuzetim sa interneta), jer ffmpeg sam po sebi ne ume da
-iscrta emotikone u boji. Python prvo nacrta ceo natpis (tekst + emoji) kao
-providnu PNG sliku, tacno izmerenu da stane u zadati broj redova i da bude
-centrirana, pa se ta slika "zalepi" preko videa.
+na Instagram, u krug (rotation). Kratki klipovi (ispod SHORT_CLIP_THRESHOLD
+sekundi) se automatski spajaju sa sledecim kratkim klipovima (istim redom
+kojim su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi.
+Duzi klipovi ostaju nepromenjeni, objavljuju se pojedinacno.
+
+Pre objave, na video dodaje tekst SA PRAVIM emoji slicicama (preuzetim sa
+interneta), jer ffmpeg sam po sebi ne ume da iscrta emotikone u boji. Python
+prvo nacrta ceo natpis (tekst + emoji) kao providnu PNG sliku, tacno
+izmerenu da stane u zadati broj redova i da bude centrirana, pa se ta slika
+"zalepi" preko videa.
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -45,6 +50,10 @@ TEXT_COLOR = (255, 255, 255, 255)
 LINE_HEIGHT_FACTOR = 1.35
 MAX_TEXT_WIDTH_FRACTION = 0.86
 
+# Kratki klipovi (u sekundama) se spajaju dok zbir ne dostigne ovoliko.
+SHORT_CLIP_THRESHOLD = 9.0
+MIN_COMBINED_DURATION = 15.0
+
 TOP_TEXTS = [
     "Da li ćeš preživeti ceo VAMIT-5 sat? 😱",
     "99% ljudi ne uspe kompletan VAMIT-5 sat ❌",
@@ -68,6 +77,11 @@ BOTTOM_TEXTS = [
     "Poruči danas - stiže brzo 🕐",
 ]
 
+RULE_TEXT = (
+    "Pravilo: Imaš 2 minuta vremena da uradiš ceo VAMIT-5 sat, "
+    "grudi do dole, ruke se ispružaju maksimalno, nedozvoljeno je ići na kolena."
+)
+
 
 def get_drive_service():
     creds_json = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
@@ -79,15 +93,60 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
+    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja,
+    zajedno sa trajanjem (ako ga je Google Drive vec izracunao)."""
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
     results = (
         service.files()
-        .list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime")
+        .list(
+            q=query,
+            fields="files(id, name, createdTime, videoMediaMetadata(durationMillis))",
+            orderBy="createdTime",
+        )
         .execute()
     )
     return results.get("files", [])
+
+
+def get_duration_seconds(video):
+    meta = video.get("videoMediaMetadata", {})
+    ms = meta.get("durationMillis")
+    if ms is None:
+        return None
+    return int(ms) / 1000.0
+
+
+def build_playlist(videos):
+    """Pravi listu 'jedinica za objavu'. Video kraci od SHORT_CLIP_THRESHOLD
+    sekundi se spaja sa sledecim kratkim klipovima (istim redosledom kojim
+    su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi. Duzi
+    klipovi (ili oni kojima Drive jos nije izracunao trajanje -- obicno
+    odmah posle otpremanja) se objavljuju pojedinacno, nepromenjeni."""
+    playlist = []
+    buffer = []
+    buffer_duration = 0.0
+
+    def flush():
+        nonlocal buffer, buffer_duration
+        if buffer:
+            playlist.append(list(buffer))
+            buffer = []
+            buffer_duration = 0.0
+
+    for video in videos:
+        duration = get_duration_seconds(video)
+        if duration is None or duration >= SHORT_CLIP_THRESHOLD:
+            flush()
+            playlist.append([video])
+        else:
+            buffer.append(video)
+            buffer_duration += duration
+            if buffer_duration >= MIN_COMBINED_DURATION:
+                flush()
+    flush()
+    return playlist
 
 
 def download_file(service, file_id, local_path):
@@ -102,6 +161,8 @@ def download_file(service, file_id, local_path):
 
 
 def get_video_dimensions(local_path):
+    """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
+    rotacione metapodatke koje telefoni cesto upisuju."""
     result = subprocess.run(
         [
             "ffprobe",
@@ -133,6 +194,37 @@ def get_video_dimensions(local_path):
         width, height = height, width
 
     return width, height
+
+
+def concatenate_clips(local_paths, output_path):
+    """Spaja vise kratkih klipova u jedan video (bez zvuka, da bi se
+    izbegli problemi sa razlicitim audio formatima medju klipovima).
+    Svi klipovi se skaliraju/podlogiraju na dimenzije prvog klipa."""
+    target_w, target_h = get_video_dimensions(local_paths[0])
+
+    inputs = []
+    filter_parts = []
+    for i, path in enumerate(local_paths):
+        inputs += ["-i", path]
+        filter_parts.append(
+            f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+        )
+    concat_inputs = "".join(f"[v{i}]" for i in range(len(local_paths)))
+    filter_complex = (
+        ";".join(filter_parts)
+        + f";{concat_inputs}concat=n={len(local_paths)}:v=1:a=0[outv]"
+    )
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-an",
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        output_path,
+    ]
+    print("Spajam klipove:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
 EMOJI_PATTERN = re.compile(
@@ -313,7 +405,8 @@ def build_caption(top_original, bottom_original):
         f"{top_original}\n"
         f"{bottom_original}\n\n"
         f"#vamit5sat\n"
-        f"Link ka Online Shopu je u opisu profila!"
+        f"Link ka Online Shopu je u opisu profila!\n\n"
+        f"{RULE_TEXT}"
     )
 
 
@@ -396,19 +489,32 @@ def main():
         print("Nema video fajlova u Google Drive folderu. Preskacem.")
         return
 
-    state = load_state()
-    next_index = (state["last_index"] + 1) % len(videos)
-    video = videos[next_index]
+    playlist = build_playlist(videos)
 
-    print(f"Redosled: {next_index + 1}/{len(videos)} -- obradjujem: {video['name']}")
+    state = load_state()
+    next_index = (state["last_index"] + 1) % len(playlist)
+    unit = playlist[next_index]
+
+    print(f"Redosled: {next_index + 1}/{len(playlist)} -- fajlova u ovoj objavi: {len(unit)}")
 
     top_original = random.choice(TOP_TEXTS)
     bottom_original = random.choice(BOTTOM_TEXTS)
 
-    local_in = "original.mp4"
     local_out = "sa_tekstom.mp4"
 
-    download_file(drive, video["id"], local_in)
+    if len(unit) == 1:
+        local_in = "original.mp4"
+        download_file(drive, unit[0]["id"], local_in)
+    else:
+        clip_paths = []
+        for i, video in enumerate(unit):
+            path = f"clip_{i}.mp4"
+            download_file(drive, video["id"], path)
+            clip_paths.append(path)
+        local_in = "combined.mp4"
+        concatenate_clips(clip_paths, local_in)
+        print(f"Spojeno {len(unit)} kratkih klipova u jedan video: {[v['name'] for v in unit]}")
+
     width, height = get_video_dimensions(local_in)
     print(f"Dimenzije videa (posle rotacije): {width}x{height}")
     add_text_overlay(local_in, local_out, width, height, top_original, bottom_original)
