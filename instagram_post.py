@@ -15,7 +15,8 @@ Pre objave, na video dodaje tekst SA PRAVIM emoji slicicama (preuzetim sa
 interneta), jer ffmpeg sam po sebi ne ume da iscrta emotikone u boji. Python
 prvo nacrta ceo natpis (tekst + emoji) kao providnu PNG sliku, tacno
 izmerenu da stane u zadati broj redova i da bude centrirana, pa se ta slika
-"zalepi" preko videa.
+"zalepi" preko videa. Ako tekst ne stane ni na najmanjoj velicini slova,
+NIKAD se ne brisu reci -- dodaje se jos redova umesto toga.
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -352,8 +353,11 @@ def fit_tokens(text, video_width, max_lines):
             return lines, fontsize
         fontsize -= 2
 
+    # Ako ni na najmanjoj velicini ne stane u trazeni broj redova, NIKAD ne
+    # brisemo reci -- vracamo SVE redove (makar bilo vise redova nego sto
+    # je trazeno). Bolje veci natpis nego odsecen tekst.
     font = ImageFont.truetype(FONT_PATH, FONT_MIN_SIZE)
-    lines = wrap_tokens(tokens, font, FONT_MIN_SIZE, max_width_px)[:max_lines]
+    lines = wrap_tokens(tokens, font, FONT_MIN_SIZE, max_width_px)
     return lines, FONT_MIN_SIZE
 
 
