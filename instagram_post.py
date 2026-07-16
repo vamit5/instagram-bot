@@ -1,30 +1,23 @@
 """
 Skripta koja automatski objavljuje sledeci video (reel) sa Google Drive foldera
-na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
-- gornji deo: nasumicno izabrana poruka (do 2 reda)
-- donji deo: nasumicno izabrana cena/poruka (1 red)
-
-Velicina i prelamanje teksta se racunaju tako sto se STVARNO MERI sirina
-teksta (u pikselima, istim fontom koji koristi i ffmpeg), tako da tekst
-nikad ne ide van kadra videa.
-
-Isti tekstovi (ali sa emotikonima, koji na videu ne rade pouzdano) se
-koriste i za opis (caption) ispod objave na Instagramu.
-
-Obradjeni video se privremeno otprema na Cloudinary (besplatan servis za
-hostovanje), jer Instagram zahteva javni link do videa da bi ga objavio.
+na Instagram, u krug (rotation). Pre objave, na video dodaje tekst SA PRAVIM
+emoji slicicama (preuzetim sa interneta), jer ffmpeg sam po sebi ne ume da
+iscrta emotikone u boji. Python prvo nacrta ceo natpis (tekst + emoji) kao
+providnu PNG sliku, tacno izmerenu da stane u zadati broj redova i da bude
+centrirana, pa se ta slika "zalepi" preko videa.
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
 
 import os
+import io
 import json
 import re
 import time
 import random
 import subprocess
 import requests
-from PIL import ImageFont
+from PIL import Image, ImageDraw, ImageFont
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -38,13 +31,18 @@ CLOUDINARY_CLOUD_NAME = "dnbjvccgy"
 CLOUDINARY_UPLOAD_PRESET = "instagram_bot"
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/"
 
 TOP_TEXT_Y_FRACTION = 0.14
 BOTTOM_TEXT_Y_FRACTION = 0.80
 
-FONT_BASE_SIZE = 100
+FONT_BASE_SIZE = 90
 FONT_MIN_SIZE = 40
-BOX_BORDER = 20
+BOX_BORDER = 24
+BOX_RADIUS = 18
+BOX_COLOR = (0, 0, 0, 140)
+TEXT_COLOR = (255, 255, 255, 255)
+LINE_HEIGHT_FACTOR = 1.35
 MAX_TEXT_WIDTH_FRACTION = 0.86
 
 TOP_TEXTS = [
@@ -149,79 +147,157 @@ EMOJI_PATTERN = re.compile(
 )
 
 
-def strip_emoji(text):
-    return EMOJI_PATTERN.sub("", text).strip()
+def tokenize(text):
+    """Deli tekst na 'reci' i 'emoji grupe', cuvajuci redosled, da bi
+    moglo da se meri i prelama red po red uzimajuci u obzir oboje."""
+    tokens = []
+    pos = 0
+    for m in EMOJI_PATTERN.finditer(text):
+        before = text[pos:m.start()]
+        for w in before.split():
+            tokens.append({"text": w, "emoji": False})
+        tokens.append({"text": m.group(), "emoji": True})
+        pos = m.end()
+    for w in text[pos:].split():
+        tokens.append({"text": w, "emoji": False})
+    return tokens
 
 
-def escape_ffmpeg_text(text):
-    return (
-        text.replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace(",", "\\,")
-    )
-def wrap_by_pixel_width(text, font, max_width_px):
-    words = text.split()
+def token_width(token, font, fontsize):
+    if token["emoji"]:
+        return fontsize * len(token["text"])
+    return font.getlength(token["text"])
+
+
+def line_width(line, font, fontsize, space_w):
+    total = 0
+    for i, tok in enumerate(line):
+        total += token_width(tok, font, fontsize)
+        if i < len(line) - 1:
+            total += space_w
+    return total
+
+
+def wrap_tokens(tokens, font, fontsize, max_width_px):
+    space_w = font.getlength(" ")
     lines = []
-    current = ""
-    for word in words:
-        candidate = (current + " " + word).strip()
-        w = font.getlength(candidate)
-        if w <= max_width_px or not current:
-            current = candidate
-        else:
+    current = []
+    current_w = 0
+    for tok in tokens:
+        w = token_width(tok, font, fontsize)
+        added = w if not current else w + space_w
+        if current and current_w + added > max_width_px:
             lines.append(current)
-            current = word
+            current = [tok]
+            current_w = w
+        else:
+            current.append(tok)
+            current_w += added
     if current:
         lines.append(current)
     return lines
-
-
-def fit_text(text, video_width, max_lines):
+    def fit_tokens(text, video_width, max_lines):
     max_width_px = int(video_width * MAX_TEXT_WIDTH_FRACTION) - (2 * BOX_BORDER)
     max_width_px = max(max_width_px, 50)
+    tokens = tokenize(text)
 
     fontsize = FONT_BASE_SIZE
     while fontsize >= FONT_MIN_SIZE:
         font = ImageFont.truetype(FONT_PATH, fontsize)
-        lines = wrap_by_pixel_width(text, font, max_width_px)
-        fits_width = all(font.getlength(line) <= max_width_px for line in lines)
-        if len(lines) <= max_lines and fits_width:
+        lines = wrap_tokens(tokens, font, fontsize, max_width_px)
+        space_w = font.getlength(" ")
+        fits = all(line_width(l, font, fontsize, space_w) <= max_width_px for l in lines)
+        if len(lines) <= max_lines and fits:
             return lines, fontsize
         fontsize -= 2
 
     font = ImageFont.truetype(FONT_PATH, FONT_MIN_SIZE)
-    lines = wrap_by_pixel_width(text, font, max_width_px)[:max_lines]
+    lines = wrap_tokens(tokens, font, FONT_MIN_SIZE, max_width_px)[:max_lines]
     return lines, FONT_MIN_SIZE
 
 
-def build_drawtext(lines, fontsize, y_fraction, height):
-    text_with_breaks = "\n".join(escape_ffmpeg_text(line) for line in lines)
-    y = int(height * y_fraction)
-    return (
-        f"drawtext=fontfile={FONT_PATH}:text='{text_with_breaks}':"
-        f"fontsize={fontsize}:fontcolor=white:line_spacing=10:"
-        f"x=(w-text_w)/2:y={y}:"
-        f"box=1:boxcolor=black@0.55:boxborderw={BOX_BORDER}"
-    )
+def get_emoji_image(char, size, cache):
+    codepoint = format(ord(char), "x")
+    key = (codepoint, size)
+    if key in cache:
+        return cache[key]
+    url = TWEMOJI_BASE + codepoint + ".png"
+    img = None
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        img = img.resize((size, size), Image.LANCZOS)
+    except Exception as e:
+        print(f"Ne mogu da preuzmem emoji ({char}): {e}")
+    cache[key] = img
+    return img
+
+
+def render_caption_image(lines, fontsize, emoji_cache):
+    font = ImageFont.truetype(FONT_PATH, fontsize)
+    space_w = font.getlength(" ")
+    line_height = int(fontsize * LINE_HEIGHT_FACTOR)
+
+    widths = [line_width(l, font, fontsize, space_w) for l in lines]
+    content_width = int(max(widths)) if widths else 0
+    content_height = line_height * len(lines)
+
+    img_w = content_width + 2 * BOX_BORDER
+    img_h = content_height + 2 * BOX_BORDER
+
+    img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, img_w, img_h], radius=BOX_RADIUS, fill=BOX_COLOR)
+
+    y = BOX_BORDER
+    for line, lw in zip(lines, widths):
+        x = BOX_BORDER + (content_width - lw) / 2
+        for tok in line:
+            if tok["emoji"]:
+                for ch in tok["text"]:
+                    em_img = get_emoji_image(ch, fontsize, emoji_cache)
+                    if em_img is not None:
+                        paste_y = int(y + (line_height - fontsize) / 2)
+                        img.paste(em_img, (int(x), paste_y), em_img)
+                    x += fontsize
+            else:
+                draw.text((x, y + (line_height - fontsize) / 2), tok["text"], font=font, fill=TEXT_COLOR)
+                x += font.getlength(tok["text"])
+            x += space_w
+        y += line_height
+
+    return img
 
 
 def add_text_overlay(local_in, local_out, width, height, top_original, bottom_original):
-    top_text = strip_emoji(top_original)
-    bottom_text = strip_emoji(bottom_original)
+    emoji_cache = {}
 
-    top_lines, top_size = fit_text(top_text, width, max_lines=2)
-    bottom_lines, bottom_size = fit_text(bottom_text, width, max_lines=1)
+    top_lines, top_size = fit_tokens(top_original, width, max_lines=2)
+    bottom_lines, bottom_size = fit_tokens(bottom_original, width, max_lines=1)
 
-    drawtext_top = build_drawtext(top_lines, top_size, TOP_TEXT_Y_FRACTION, height)
-    drawtext_bottom = build_drawtext(bottom_lines, bottom_size, BOTTOM_TEXT_Y_FRACTION, height)
+    top_img = render_caption_image(top_lines, top_size, emoji_cache)
+    bottom_img = render_caption_image(bottom_lines, bottom_size, emoji_cache)
 
-    filter_chain = f"{drawtext_top},{drawtext_bottom}"
+    top_path = "top_overlay.png"
+    bottom_path = "bottom_overlay.png"
+    top_img.save(top_path)
+    bottom_img.save(bottom_path)
+
+    top_y = int(height * TOP_TEXT_Y_FRACTION)
+    bottom_y = int(height * BOTTOM_TEXT_Y_FRACTION)
+
+    filter_complex = (
+        f"[0:v][1:v]overlay=(W-w)/2:{top_y}[tmp1];"
+        f"[tmp1][2:v]overlay=(W-w)/2:{bottom_y}"
+    )
 
     cmd = [
         "ffmpeg", "-y",
         "-i", local_in,
-        "-vf", filter_chain,
+        "-i", top_path,
+        "-i", bottom_path,
+        "-filter_complex", filter_complex,
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
         "-c:a", "copy",
         local_out,
