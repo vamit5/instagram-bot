@@ -5,6 +5,12 @@ sekundi) se automatski spajaju sa sledecim kratkim klipovima (istim redom
 kojim su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi.
 Duzi klipovi ostaju nepromenjeni, objavljuju se pojedinacno.
 
+Trajanje svakog videa se prvo pokusava ocitati iz Google Drive metapodataka
+(brzo, bez preuzimanja). Ako Drive to jos nije izracunao (cesto slucaj sa
+netom otpremljenim fajlovima), skripta SAMA preuzme taj video i izmeri
+trajanje preko ffprobe -- ovo garantuje da kratak video nikad ne prodje kao
+"dug" zbog nedostajucih metapodataka.
+
 Pre objave, na video dodaje tekst SA PRAVIM emoji slicicama (preuzetim sa
 interneta), jer ffmpeg sam po sebi ne ume da iscrta emotikone u boji. Python
 prvo nacrta ceo natpis (tekst + emoji) kao providnu PNG sliku, tacno
@@ -110,20 +116,62 @@ def list_videos(service, folder_id):
     return results.get("files", [])
 
 
-def get_duration_seconds(video):
-    meta = video.get("videoMediaMetadata", {})
-    ms = meta.get("durationMillis")
-    if ms is None:
-        return None
-    return int(ms) / 1000.0
+def download_file(service, file_id, local_path):
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"Preuzimanje: {int(status.progress() * 100)}%")
+
+
+def get_duration_via_ffprobe(local_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            local_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    return float(data["format"]["duration"])
+
+
+def ensure_durations(drive, videos):
+    """Za svaki video kome Drive JOS NIJE izracunao trajanje (cesto kod
+    netom otpremljenih fajlova), skripta ga sama preuzme i izmeri stvarno
+    trajanje preko ffprobe. Preuzeti fajl se cuva (u video['_probed_path'])
+    da se ne bi preuzimao dvaput ako bas taj video bude izabran za objavu
+    u ovom pokretanju."""
+    for video in videos:
+        meta = video.get("videoMediaMetadata", {})
+        ms = meta.get("durationMillis")
+        if ms is not None:
+            video["_duration"] = int(ms) / 1000.0
+            continue
+
+        local_path = f"probe_{video['id']}.mp4"
+        try:
+            download_file(drive, video["id"], local_path)
+            video["_duration"] = get_duration_via_ffprobe(local_path)
+            video["_probed_path"] = local_path
+            print(f"Drive nije imao trajanje za '{video['name']}', izmereno: {video['_duration']:.1f}s")
+        except Exception as e:
+            print(f"Ne mogu da izmerim trajanje za '{video['name']}': {e} -- tretiram kao dug video.")
+            video["_duration"] = None
 
 
 def build_playlist(videos):
     """Pravi listu 'jedinica za objavu'. Video kraci od SHORT_CLIP_THRESHOLD
     sekundi se spaja sa sledecim kratkim klipovima (istim redosledom kojim
     su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi. Duzi
-    klipovi (ili oni kojima Drive jos nije izracunao trajanje -- obicno
-    odmah posle otpremanja) se objavljuju pojedinacno, nepromenjeni."""
+    klipovi se objavljuju pojedinacno, nepromenjeni."""
     playlist = []
     buffer = []
     buffer_duration = 0.0
@@ -136,7 +184,7 @@ def build_playlist(videos):
             buffer_duration = 0.0
 
     for video in videos:
-        duration = get_duration_seconds(video)
+        duration = video.get("_duration")
         if duration is None or duration >= SHORT_CLIP_THRESHOLD:
             flush()
             playlist.append([video])
@@ -147,17 +195,6 @@ def build_playlist(videos):
                 flush()
     flush()
     return playlist
-
-
-def download_file(service, file_id, local_path):
-    request = service.files().get_media(fileId=file_id)
-    with open(local_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                print(f"Preuzimanje: {int(status.progress() * 100)}%")
 
 
 def get_video_dimensions(local_path):
@@ -194,6 +231,16 @@ def get_video_dimensions(local_path):
         width, height = height, width
 
     return width, height
+
+
+def get_local_path(drive, video, target_path):
+    """Ako je video vec preuzet tokom merenja trajanja (ensure_durations),
+    samo ga premesti na ciljnu putanju umesto ponovnog preuzimanja."""
+    probed_path = video.get("_probed_path")
+    if probed_path and os.path.exists(probed_path):
+        os.replace(probed_path, target_path)
+    else:
+        download_file(drive, video["id"], target_path)
 
 
 def concatenate_clips(local_paths, output_path):
@@ -489,6 +536,7 @@ def main():
         print("Nema video fajlova u Google Drive folderu. Preskacem.")
         return
 
+    ensure_durations(drive, videos)
     playlist = build_playlist(videos)
 
     state = load_state()
@@ -504,12 +552,12 @@ def main():
 
     if len(unit) == 1:
         local_in = "original.mp4"
-        download_file(drive, unit[0]["id"], local_in)
+        get_local_path(drive, unit[0], local_in)
     else:
         clip_paths = []
         for i, video in enumerate(unit):
             path = f"clip_{i}.mp4"
-            download_file(drive, video["id"], path)
+            get_local_path(drive, video, path)
             clip_paths.append(path)
         local_in = "combined.mp4"
         concatenate_clips(clip_paths, local_in)
