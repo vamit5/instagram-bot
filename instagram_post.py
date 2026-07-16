@@ -4,6 +4,10 @@ na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
 - gornji deo: nasumicno izabrana poruka (do 2 reda)
 - donji deo: nasumicno izabrana cena/poruka (1 red)
 
+Velicina i prelamanje teksta se racunaju tako sto se STVARNO MERI sirina
+teksta (u pikselima, istim fontom koji koristi i ffmpeg), tako da tekst
+nikad ne ide van kadra videa.
+
 Isti tekstovi (ali sa emotikonima, koji na videu ne rade pouzdano) se
 koriste i za opis (caption) ispod objave na Instagramu.
 
@@ -18,9 +22,9 @@ import json
 import re
 import time
 import random
-import textwrap
 import subprocess
 import requests
+from PIL import ImageFont
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -35,21 +39,14 @@ CLOUDINARY_UPLOAD_PRESET = "instagram_bot"
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# Pozicije teksta kao procenat visine videa (0 = vrh, 1 = dno) -- potvrdjeno
-# da su ove pozicije dobre, ne diraj bez razloga.
 TOP_TEXT_Y_FRACTION = 0.14
 BOTTOM_TEXT_Y_FRACTION = 0.80
 
-# Velicina slova na videu -- veci base = veca pocetna velicina, skripta je
-# sama smanjuje samo ako mora da stane u dozvoljen broj redova.
-FONT_BASE_SIZE = 120
-FONT_MIN_SIZE = 56
-FONT_WIDTH_FACTOR = 0.5
+FONT_BASE_SIZE = 100
+FONT_MIN_SIZE = 40
+BOX_BORDER = 20
+MAX_TEXT_WIDTH_FRACTION = 0.86
 
-# Ovi tekstovi se koriste NA VIDEU (bez emotikona) i, sa emotikonima, u
-# opisu (caption) ispod objave. Napomena: neki pominju dete, a skripta ne
-# moze da prepozna da li dete stvarno postoji na snimku -- ubaceni su na
-# izricit zahtev, pa ce se povremeno pojaviti i na snimcima bez dece.
 TOP_TEXTS = [
     "Da li ćeš preživeti ceo VAMIT-5 sat? 😱",
     "99% ljudi ne uspe kompletan VAMIT-5 sat ❌",
@@ -84,8 +81,6 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
-    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja
-    (najstariji prvi), tako da je redosled objavljivanja predvidiv."""
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
@@ -109,8 +104,6 @@ def download_file(service, file_id, local_path):
 
 
 def get_video_dimensions(local_path):
-    """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
-    rotacione metapodatke koje telefoni cesto upisuju."""
     result = subprocess.run(
         [
             "ffprobe",
@@ -167,21 +160,38 @@ def escape_ffmpeg_text(text):
         .replace("'", "\\'")
         .replace(",", "\\,")
     )
+    def wrap_by_pixel_width(text, font, max_width_px):
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = (current + " " + word).strip()
+        w = font.getlength(candidate)
+        if w <= max_width_px or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
-def wrap_and_fit(text, width, max_lines):
-    """Smanjuje velicinu slova dok tekst ne stane u najvise max_lines
-    redova, bez sece/preklapanja."""
+def fit_text(text, video_width, max_lines):
+    max_width_px = int(video_width * MAX_TEXT_WIDTH_FRACTION) - (2 * BOX_BORDER)
+    max_width_px = max(max_width_px, 50)
+
     fontsize = FONT_BASE_SIZE
     while fontsize >= FONT_MIN_SIZE:
-        chars_per_line = max(6, int(width / (fontsize * FONT_WIDTH_FACTOR)))
-        lines = textwrap.wrap(text, width=chars_per_line)
-        if len(lines) <= max_lines:
+        font = ImageFont.truetype(FONT_PATH, fontsize)
+        lines = wrap_by_pixel_width(text, font, max_width_px)
+        fits_width = all(font.getlength(line) <= max_width_px for line in lines)
+        if len(lines) <= max_lines and fits_width:
             return lines, fontsize
-        fontsize -= 3
+        fontsize -= 2
 
-    chars_per_line = max(6, int(width / (FONT_MIN_SIZE * FONT_WIDTH_FACTOR)))
-    lines = textwrap.wrap(text, width=chars_per_line)[:max_lines]
+    font = ImageFont.truetype(FONT_PATH, FONT_MIN_SIZE)
+    lines = wrap_by_pixel_width(text, font, max_width_px)[:max_lines]
     return lines, FONT_MIN_SIZE
 
 
@@ -192,7 +202,7 @@ def build_drawtext(lines, fontsize, y_fraction, height):
         f"drawtext=fontfile={FONT_PATH}:text='{text_with_breaks}':"
         f"fontsize={fontsize}:fontcolor=white:line_spacing=10:"
         f"x=(w-text_w)/2:y={y}:"
-        f"box=1:boxcolor=black@0.55:boxborderw=20"
+        f"box=1:boxcolor=black@0.55:boxborderw={BOX_BORDER}"
     )
 
 
@@ -200,8 +210,8 @@ def add_text_overlay(local_in, local_out, width, height, top_original, bottom_or
     top_text = strip_emoji(top_original)
     bottom_text = strip_emoji(bottom_original)
 
-    top_lines, top_size = wrap_and_fit(top_text, width, max_lines=2)
-    bottom_lines, bottom_size = wrap_and_fit(bottom_text, width, max_lines=1)
+    top_lines, top_size = fit_text(top_text, width, max_lines=2)
+    bottom_lines, bottom_size = fit_text(bottom_text, width, max_lines=1)
 
     drawtext_top = build_drawtext(top_lines, top_size, TOP_TEXT_Y_FRACTION, height)
     drawtext_bottom = build_drawtext(bottom_lines, bottom_size, BOTTOM_TEXT_Y_FRACTION, height)
