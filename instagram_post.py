@@ -1,8 +1,8 @@
 """
 Skripta koja automatski objavljuje sledeci video (reel) sa Google Drive foldera
 na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
-- gornji deo: nasumicno izabrana poruka sa liste
-- donji deo: fiksna cena/poruka
+- gornji deo: nasumicno izabrana poruka (do 2 reda)
+- donji deo: nasumicno izabrana cena/poruka (1 red)
 
 Obradjeni video se privremeno otprema na Cloudinary (besplatan servis za
 hostovanje), jer Instagram zahteva javni link do videa da bi ga objavio.
@@ -12,8 +12,10 @@ Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 
 import os
 import json
+import re
 import time
 import random
+import textwrap
 import subprocess
 import requests
 from google.oauth2 import service_account
@@ -28,24 +30,47 @@ API_BASE = "https://graph.instagram.com"
 CLOUDINARY_CLOUD_NAME = "dnbjvccgy"
 CLOUDINARY_UPLOAD_PRESET = "instagram_bot"
 
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Pozicije teksta kao procenat visine videa (0 = vrh, 1 = dno) -- potvrdjeno
+# da su ove pozicije dobre, ne diraj bez razloga.
+TOP_TEXT_Y_FRACTION = 0.14
+BOTTOM_TEXT_Y_FRACTION = 0.80
+
+# Caption koji ide ISPOD objave na Instagramu (tu emotikoni rade savrseno,
+# jer to renderuje sam Instagram, ne nasa skripta).
 IG_CAPTION = (
-    "Napravi haos u drustvu sa #vamit5sat - Samo 19e danas! "
+    "Napravi haos u drustvu sa #vamit5sat 😱🕐 - Samo 19e danas! "
     "Link ka Online Shopu je u opisu profila."
 )
 
-BOTTOM_TEXT = "Danas samo 19e"
-
+# Tekstovi za VRH videa. Emotikoni namerno izostavljeni (ffmpeg ne prikazuje
+# emotikone u boji pouzdano -- ostaju samo u IG_CAPTION iznad).
+# Napomena: neki od ovih tekstova pominju dete, a skripta ne moze da
+# prepozna da li dete stvarno postoji na snimku -- ubaceni su na izricit
+# zahtev, pa ce se povremeno pojaviti i na snimcima bez dece.
 TOP_TEXTS = [
-    "Napravi haos u drustvu",
-    "Da li mozes pobediti VAMIT-5 sat",
-    "99% ljudi ne uspe VAMIT-5 sat do kraja",
+    "Da li ces preziveti ceo VAMIT-5 sat?",
+    "99% ljudi ne uspe kompletan VAMIT-5 sat",
+    "Napravi haos u drustvu sa VAMIT-5 satom",
+    "VAMIT-5 sat napravio haos na Balkanu",
+    "Ljudi poludeli za VAMIT-5 satom",
+    "Najtrazeniji fitnes proizvod u regiji",
+    "Idealan proizvod za trenere i njegove klijente",
+    "Napravi nezaboravnu zurku sa VAMIT-5 satom",
+    "Tvoje dete ce se obradovati ovom satu",
+    "Vreme je da poklonis ovaj sat svom detetu",
+    "Pokloni ovaj sat svom detetu, unuku i gledaj napade srece",
+    "Tvoje dete te tajno moli da mu kupis ovaj sat",
 ]
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-# Pozicije teksta kao procenat visine videa (0 = vrh, 1 = dno)
-TOP_TEXT_Y_FRACTION = 0.14
-BOTTOM_TEXT_Y_FRACTION = 0.80
+BOTTOM_TEXTS = [
+    "Poruci danas za samo 19e",
+    "Danas samo 19e (Link u BIO)",
+    "Jos samo danas 19e",
+    "Dostava sirom Evrope",
+    "Poruci danas - stize brzo",
+]
 
 
 def get_drive_service():
@@ -84,9 +109,7 @@ def download_file(service, file_id, local_path):
 
 def get_video_dimensions(local_path):
     """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
-    rotacione metapodatke koje telefoni cesto upisuju (video snimljen
-    'uspravno' moze biti sacuvan sa sirinom/visinom obrnutim, plus oznakom
-    da ga treba rotirati pri prikazu)."""
+    rotacione metapodatke koje telefoni cesto upisuju."""
     result = subprocess.run(
         [
             "ffprobe",
@@ -120,6 +143,22 @@ def get_video_dimensions(local_path):
     return width, height
 
 
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_emoji(text):
+    return EMOJI_PATTERN.sub("", text).strip()
+
+
 def escape_ffmpeg_text(text):
     return (
         text.replace("\\", "\\\\")
@@ -129,36 +168,46 @@ def escape_ffmpeg_text(text):
     )
 
 
-def compute_fontsize(text, width):
-    size = int(width / (max(len(text), 10) * 0.5))
-    return max(40, min(90, size))
+def wrap_and_fit(text, width, max_lines, base_fontsize, min_fontsize):
+    """Smanjuje velicinu slova dok tekst ne stane u najvise max_lines
+    redova, bez sece/preklapanja."""
+    fontsize = base_fontsize
+    while fontsize >= min_fontsize:
+        chars_per_line = max(6, int(width / (fontsize * 0.56)))
+        lines = textwrap.wrap(text, width=chars_per_line)
+        if len(lines) <= max_lines:
+            return lines, fontsize
+        fontsize -= 3
+
+    chars_per_line = max(6, int(width / (min_fontsize * 0.56)))
+    lines = textwrap.wrap(text, width=chars_per_line)[:max_lines]
+    return lines, min_fontsize
+
+
+def build_drawtext(lines, fontsize, y_fraction, height):
+    text_with_breaks = "\n".join(escape_ffmpeg_text(line) for line in lines)
+    y = int(height * y_fraction)
+    return (
+        f"drawtext=fontfile={FONT_PATH}:text='{text_with_breaks}':"
+        f"fontsize={fontsize}:fontcolor=white:line_spacing=10:"
+        f"x=(w-text_w)/2:y={y}:"
+        f"box=1:boxcolor=black@0.55:boxborderw=20"
+    )
 
 
 def add_text_overlay(local_in, local_out, width, height):
-    top_text = random.choice(TOP_TEXTS)
-    bottom_text = BOTTOM_TEXT
+    top_text = strip_emoji(random.choice(TOP_TEXTS))
+    bottom_text = strip_emoji(random.choice(BOTTOM_TEXTS))
 
-    top_size = compute_fontsize(top_text, width)
-    bottom_size = compute_fontsize(bottom_text, width)
-
-    top_escaped = escape_ffmpeg_text(top_text)
-    bottom_escaped = escape_ffmpeg_text(bottom_text)
-
-    top_y = int(height * TOP_TEXT_Y_FRACTION)
-    bottom_y = int(height * BOTTOM_TEXT_Y_FRACTION)
-
-    drawtext_top = (
-        f"drawtext=fontfile={FONT_PATH}:text='{top_escaped}':"
-        f"fontsize={top_size}:fontcolor=white:"
-        f"x=(w-text_w)/2:y={top_y}:"
-        f"box=1:boxcolor=black@0.55:boxborderw=20"
+    top_lines, top_size = wrap_and_fit(
+        top_text, width, max_lines=2, base_fontsize=78, min_fontsize=46
     )
-    drawtext_bottom = (
-        f"drawtext=fontfile={FONT_PATH}:text='{bottom_escaped}':"
-        f"fontsize={bottom_size}:fontcolor=white:"
-        f"x=(w-text_w)/2:y={bottom_y}:"
-        f"box=1:boxcolor=black@0.55:boxborderw=20"
+    bottom_lines, bottom_size = wrap_and_fit(
+        bottom_text, width, max_lines=1, base_fontsize=78, min_fontsize=46
     )
+
+    drawtext_top = build_drawtext(top_lines, top_size, TOP_TEXT_Y_FRACTION, height)
+    drawtext_bottom = build_drawtext(bottom_lines, bottom_size, BOTTOM_TEXT_Y_FRACTION, height)
 
     filter_chain = f"{drawtext_top},{drawtext_bottom}"
 
