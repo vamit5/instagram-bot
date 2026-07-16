@@ -3,7 +3,9 @@ Skripta koja automatski objavljuje sledeci video (reel) sa Google Drive foldera
 na Instagram, u krug (rotation). Kratki klipovi (ispod SHORT_CLIP_THRESHOLD
 sekundi) se automatski spajaju sa sledecim kratkim klipovima (istim redom
 kojim su na Drive-u) dok zbir ne dostigne MIN_COMBINED_DURATION sekundi.
-Duzi klipovi ostaju nepromenjeni, objavljuju se pojedinacno.
+Duzi klipovi ostaju nepromenjeni, objavljuju se pojedinacno. Spojeni klipovi
+ZADRZAVAJU svoj originalni zvuk (ako neki klip nema zvuk, dodaje mu se tiha
+audio traka iste duzine, da bi spajanje uopste bilo moguce).
 
 Trajanje svakog videa se prvo pokusava ocitati iz Google Drive metapodataka
 (brzo, bez preuzimanja). Ako Drive to jos nije izracunao (cesto slucaj sa
@@ -17,6 +19,10 @@ prvo nacrta ceo natpis (tekst + emoji) kao providnu PNG sliku, tacno
 izmerenu da stane u zadati broj redova i da bude centrirana, pa se ta slika
 "zalepi" preko videa. Ako tekst ne stane ni na najmanjoj velicini slova,
 NIKAD se ne brisu reci -- dodaje se jos redova umesto toga.
+
+Gornji i donji tekst se biraju iz "rotirajuce" liste -- isti tekst se NIKAD
+ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
+rotacije se cuva u state.json).
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -144,6 +150,23 @@ def get_duration_via_ffprobe(local_path):
     return float(data["format"]["duration"])
 
 
+def has_audio_stream(local_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "json",
+            local_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    return len(data.get("streams", [])) > 0
+
+
 def ensure_durations(drive, videos):
     """Za svaki video kome Drive JOS NIJE izracunao trajanje (cesto kod
     netom otpremljenih fajlova), skripta ga sama preuzme i izmeri stvarno
@@ -244,34 +267,60 @@ def get_local_path(drive, video, target_path):
         download_file(drive, video["id"], target_path)
 
 
-def concatenate_clips(local_paths, output_path):
-    """Spaja vise kratkih klipova u jedan video (bez zvuka, da bi se
-    izbegli problemi sa razlicitim audio formatima medju klipovima).
-    Svi klipovi se skaliraju/podlogiraju na dimenzije prvog klipa."""
+def concatenate_clips(local_paths, durations, output_path):
+    """Spaja vise kratkih klipova u jedan video, CUVAJUCI zvuk svakog
+    klipa. Ako neki klip nema audio traku, dodaje mu se tiha traka iste
+    duzine (inace spajanje video+audio streamova ne bi bilo moguce)."""
     target_w, target_h = get_video_dimensions(local_paths[0])
 
     inputs = []
-    filter_parts = []
-    for i, path in enumerate(local_paths):
+    for path in local_paths:
         inputs += ["-i", path]
-        filter_parts.append(
+
+    audio_input_map = {}
+    lavfi_inputs = []
+    next_index = len(local_paths)
+    for i, (path, duration) in enumerate(zip(local_paths, durations)):
+        if has_audio_stream(path):
+            audio_input_map[i] = i
+        else:
+            lavfi_inputs += [
+                "-f", "lavfi", "-t", f"{max(duration, 0.1):.3f}",
+                "-i", "anullsrc=r=44100:cl=stereo",
+            ]
+            audio_input_map[i] = next_index
+            next_index += 1
+    inputs += lavfi_inputs
+
+    video_parts = []
+    audio_parts = []
+    concat_refs = ""
+    for i, path in enumerate(local_paths):
+        video_parts.append(
             f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}]"
         )
-    concat_inputs = "".join(f"[v{i}]" for i in range(len(local_paths)))
+        a_idx = audio_input_map[i]
+        audio_parts.append(
+            f"[{a_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+            f"asetpts=PTS-STARTPTS[a{i}]"
+        )
+        concat_refs += f"[v{i}][a{i}]"
+
     filter_complex = (
-        ";".join(filter_parts)
-        + f";{concat_inputs}concat=n={len(local_paths)}:v=1:a=0[outv]"
+        ";".join(video_parts) + ";" +
+        ";".join(audio_parts) + ";" +
+        concat_refs + f"concat=n={len(local_paths)}:v=1:a=1[outv][outa]"
     )
 
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
-        "-map", "[outv]",
-        "-an",
+        "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
-    print("Spajam klipove:", " ".join(cmd))
+    print("Spajam klipove (sa zvukom):", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
@@ -485,6 +534,29 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+def pick_next_text(state, key, options):
+    """Bira sledeci tekst iz liste tako da se NIKAD ne ponovi dok se ne
+    iskoriste svi ostali iz liste bar jednom (tzv. 'shuffled bag'
+    pristup). Kad se lista potrosi, pravi se nova, nasumicno promesana
+    runda -- vodi se racuna da se ne ponovi tekst sa kraja prethodne
+    runde odmah na pocetku nove."""
+    queue_key = f"{key}_queue"
+    last_key = f"{key}_last"
+
+    queue = state.get(queue_key, [])
+    if not queue:
+        queue = list(range(len(options)))
+        random.shuffle(queue)
+        last = state.get(last_key)
+        if len(queue) > 1 and queue[0] == last:
+            queue[0], queue[1] = queue[1], queue[0]
+
+    idx = queue.pop(0)
+    state[queue_key] = queue
+    state[last_key] = idx
+    return options[idx]
+
+
 def create_media_container(ig_user_id, access_token, video_url, caption=""):
     url = f"{API_BASE}/{GRAPH_VERSION}/{ig_user_id}/media"
     payload = {
@@ -549,8 +621,8 @@ def main():
 
     print(f"Redosled: {next_index + 1}/{len(playlist)} -- fajlova u ovoj objavi: {len(unit)}")
 
-    top_original = random.choice(TOP_TEXTS)
-    bottom_original = random.choice(BOTTOM_TEXTS)
+    top_original = pick_next_text(state, "top", TOP_TEXTS)
+    bottom_original = pick_next_text(state, "bottom", BOTTOM_TEXTS)
 
     local_out = "sa_tekstom.mp4"
 
@@ -559,12 +631,14 @@ def main():
         get_local_path(drive, unit[0], local_in)
     else:
         clip_paths = []
+        durations = []
         for i, video in enumerate(unit):
             path = f"clip_{i}.mp4"
             get_local_path(drive, video, path)
             clip_paths.append(path)
+            durations.append(video.get("_duration") or 1.0)
         local_in = "combined.mp4"
-        concatenate_clips(clip_paths, local_in)
+        concatenate_clips(clip_paths, durations, local_in)
         print(f"Spojeno {len(unit)} kratkih klipova u jedan video: {[v['name'] for v in unit]}")
 
     width, height = get_video_dimensions(local_in)
