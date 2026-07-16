@@ -4,6 +4,9 @@ na Instagram, u krug (rotation). Pre objave, na video dodaje tekst:
 - gornji deo: nasumicno izabrana poruka (do 2 reda)
 - donji deo: nasumicno izabrana cena/poruka (1 red)
 
+Isti tekstovi (ali sa emotikonima, koji na videu ne rade pouzdano) se
+koriste i za opis (caption) ispod objave na Instagramu.
+
 Obradjeni video se privremeno otprema na Cloudinary (besplatan servis za
 hostovanje), jer Instagram zahteva javni link do videa da bi ga objavio.
 
@@ -37,39 +40,37 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 TOP_TEXT_Y_FRACTION = 0.14
 BOTTOM_TEXT_Y_FRACTION = 0.80
 
-# Caption koji ide ISPOD objave na Instagramu (tu emotikoni rade savrseno,
-# jer to renderuje sam Instagram, ne nasa skripta).
-IG_CAPTION = (
-    "Napravi haos u drustvu sa #vamit5sat 😱🕐 - Samo 19e danas! "
-    "Link ka Online Shopu je u opisu profila."
-)
+# Velicina slova na videu -- veci base = veca pocetna velicina, skripta je
+# sama smanjuje samo ako mora da stane u dozvoljen broj redova.
+FONT_BASE_SIZE = 120
+FONT_MIN_SIZE = 56
+FONT_WIDTH_FACTOR = 0.5
 
-# Tekstovi za VRH videa. Emotikoni namerno izostavljeni (ffmpeg ne prikazuje
-# emotikone u boji pouzdano -- ostaju samo u IG_CAPTION iznad).
-# Napomena: neki od ovih tekstova pominju dete, a skripta ne moze da
-# prepozna da li dete stvarno postoji na snimku -- ubaceni su na izricit
-# zahtev, pa ce se povremeno pojaviti i na snimcima bez dece.
+# Ovi tekstovi se koriste NA VIDEU (bez emotikona) i, sa emotikonima, u
+# opisu (caption) ispod objave. Napomena: neki pominju dete, a skripta ne
+# moze da prepozna da li dete stvarno postoji na snimku -- ubaceni su na
+# izricit zahtev, pa ce se povremeno pojaviti i na snimcima bez dece.
 TOP_TEXTS = [
-    "Da li ces preziveti ceo VAMIT-5 sat?",
-    "99% ljudi ne uspe kompletan VAMIT-5 sat",
-    "Napravi haos u drustvu sa VAMIT-5 satom",
-    "VAMIT-5 sat napravio haos na Balkanu",
-    "Ljudi poludeli za VAMIT-5 satom",
-    "Najtrazeniji fitnes proizvod u regiji",
-    "Idealan proizvod za trenere i njegove klijente",
-    "Napravi nezaboravnu zurku sa VAMIT-5 satom",
-    "Tvoje dete ce se obradovati ovom satu",
-    "Vreme je da poklonis ovaj sat svom detetu",
-    "Pokloni ovaj sat svom detetu, unuku i gledaj napade srece",
-    "Tvoje dete te tajno moli da mu kupis ovaj sat",
+    "Da li ćeš preživeti ceo VAMIT-5 sat? 😱",
+    "99% ljudi ne uspe kompletan VAMIT-5 sat ❌",
+    "Napravi haos u društvu sa VAMIT-5 satom 🕐",
+    "VAMIT-5 sat napravio haos na Balkanu 😱🕐",
+    "Ljudi poludeli za VAMIT-5 satom 😱🕐",
+    "Najtraženiji fitnes proizvod u regiji 🕐😍",
+    "Idealan proizvod za trenere i njegove klijente 😱",
+    "Napravi nezaboravnu žurku sa VAMIT-5 satom 🕐😍",
+    "Tvoje dete će se obradovati ovom satu 😍",
+    "Vreme je da pokloniš ovaj sat svom detetu 😍",
+    "Pokloni ovaj sat svom detetu, unuku i gledaj napade sreće 🕐😍",
+    "Tvoje dete te tajno moli da mu kupiš ovaj sat 🕐😍",
 ]
 
 BOTTOM_TEXTS = [
-    "Poruci danas za samo 19e",
-    "Danas samo 19e (Link u BIO)",
-    "Jos samo danas 19e",
-    "Dostava sirom Evrope",
-    "Poruci danas - stize brzo",
+    "Poruči danas za samo 19€",
+    "Danas samo 19€ (Link u BIO)",
+    "Još samo danas 19€",
+    "Dostava širom Evrope 😍",
+    "Poruči danas - stiže brzo 🕐",
 ]
 
 
@@ -168,20 +169,20 @@ def escape_ffmpeg_text(text):
     )
 
 
-def wrap_and_fit(text, width, max_lines, base_fontsize, min_fontsize):
+def wrap_and_fit(text, width, max_lines):
     """Smanjuje velicinu slova dok tekst ne stane u najvise max_lines
     redova, bez sece/preklapanja."""
-    fontsize = base_fontsize
-    while fontsize >= min_fontsize:
-        chars_per_line = max(6, int(width / (fontsize * 0.56)))
+    fontsize = FONT_BASE_SIZE
+    while fontsize >= FONT_MIN_SIZE:
+        chars_per_line = max(6, int(width / (fontsize * FONT_WIDTH_FACTOR)))
         lines = textwrap.wrap(text, width=chars_per_line)
         if len(lines) <= max_lines:
             return lines, fontsize
         fontsize -= 3
 
-    chars_per_line = max(6, int(width / (min_fontsize * 0.56)))
+    chars_per_line = max(6, int(width / (FONT_MIN_SIZE * FONT_WIDTH_FACTOR)))
     lines = textwrap.wrap(text, width=chars_per_line)[:max_lines]
-    return lines, min_fontsize
+    return lines, FONT_MIN_SIZE
 
 
 def build_drawtext(lines, fontsize, y_fraction, height):
@@ -195,16 +196,12 @@ def build_drawtext(lines, fontsize, y_fraction, height):
     )
 
 
-def add_text_overlay(local_in, local_out, width, height):
-    top_text = strip_emoji(random.choice(TOP_TEXTS))
-    bottom_text = strip_emoji(random.choice(BOTTOM_TEXTS))
+def add_text_overlay(local_in, local_out, width, height, top_original, bottom_original):
+    top_text = strip_emoji(top_original)
+    bottom_text = strip_emoji(bottom_original)
 
-    top_lines, top_size = wrap_and_fit(
-        top_text, width, max_lines=2, base_fontsize=78, min_fontsize=46
-    )
-    bottom_lines, bottom_size = wrap_and_fit(
-        bottom_text, width, max_lines=1, base_fontsize=78, min_fontsize=46
-    )
+    top_lines, top_size = wrap_and_fit(top_text, width, max_lines=2)
+    bottom_lines, bottom_size = wrap_and_fit(bottom_text, width, max_lines=1)
 
     drawtext_top = build_drawtext(top_lines, top_size, TOP_TEXT_Y_FRACTION, height)
     drawtext_bottom = build_drawtext(bottom_lines, bottom_size, BOTTOM_TEXT_Y_FRACTION, height)
@@ -221,6 +218,15 @@ def add_text_overlay(local_in, local_out, width, height):
     ]
     print("Pokrecem ffmpeg:", " ".join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def build_caption(top_original, bottom_original):
+    return (
+        f"{top_original}\n"
+        f"{bottom_original}\n\n"
+        f"#vamit5sat\n"
+        f"Link ka Online Shopu je u opisu profila!"
+    )
 
 
 def upload_to_cloudinary(local_path):
@@ -308,18 +314,23 @@ def main():
 
     print(f"Redosled: {next_index + 1}/{len(videos)} -- obradjujem: {video['name']}")
 
+    top_original = random.choice(TOP_TEXTS)
+    bottom_original = random.choice(BOTTOM_TEXTS)
+
     local_in = "original.mp4"
     local_out = "sa_tekstom.mp4"
 
     download_file(drive, video["id"], local_in)
     width, height = get_video_dimensions(local_in)
     print(f"Dimenzije videa (posle rotacije): {width}x{height}")
-    add_text_overlay(local_in, local_out, width, height)
+    add_text_overlay(local_in, local_out, width, height, top_original, bottom_original)
 
     video_url = upload_to_cloudinary(local_out)
     print(f"Video otpremljen na: {video_url}")
 
-    container_id = create_media_container(ig_user_id, access_token, video_url, IG_CAPTION)
+    caption = build_caption(top_original, bottom_original)
+
+    container_id = create_media_container(ig_user_id, access_token, video_url, caption)
     wait_for_container(container_id, access_token)
     result = publish_container(ig_user_id, access_token, container_id)
 
