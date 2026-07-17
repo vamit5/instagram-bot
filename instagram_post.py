@@ -24,18 +24,6 @@ Gornji i donji tekst se biraju iz "rotirajuce" liste -- isti tekst se NIKAD
 ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
 rotacije se cuva u state.json).
 
-Fajlovi cije ime sadrzi rec "prioritet" se tretiraju kao viralni klipovi:
-pojavljuju se cesce, i na njih se NIKAD ne stavlja tekst preko videa (ali
-se i dalje kompresuju).
-
-SVI video izlazi se automatski smanjuju na najvise 1080px (veca strana) --
-sprecava da veliki (npr. 4K) izvorni video bude odbijen kao "prevelik".
-
-Trajne (4xx) HTTP greske se NE pokusavaju ponovo (ponavljanje ne bi
-pomoglo), sto skripti stedi vreme i sprecava da se zakazana pokretanja
-preklapaju. Privremene (mrezne, 5xx) greske se ponavljaju sa sve duzom
-pauzom.
-
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
 
@@ -121,10 +109,6 @@ def with_retry(func, *args, retries=RETRY_ATTEMPTS, delay=RETRY_BASE_DELAY, **kw
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status is not None and 400 <= status < 500:
-                # Trajna greska (npr. 413 "fajl prevelik") -- ponavljanje
-                # NIKAD nece uspeti, pa odmah odustajemo umesto da trosimo
-                # vreme (i time rizikujemo da se sledeci zakazani termin
-                # preklopi sa ovim koji predugo traje).
                 print(f"Trajna greska (HTTP {status}) -- ne pokusavam ponovo: {e}")
                 raise
             attempt += 1
@@ -312,23 +296,6 @@ def get_local_path(drive, video, target_path):
         os.replace(probed_path, target_path)
     else:
         download_file(drive, video["id"], target_path)
-
-
-MAX_VIDEO_DIMENSION = 1080
-
-
-def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
-    if max(width, height) <= max_dim:
-        new_w, new_h = width, height
-    elif width >= height:
-        new_w = max_dim
-        new_h = int(height * max_dim / width)
-    else:
-        new_h = max_dim
-        new_w = int(width * max_dim / height)
-    new_w -= new_w % 2
-    new_h -= new_h % 2
-    return max(new_w, 2), max(new_h, 2)
 
 
 def concatenate_clips(local_paths, durations, output_path):
@@ -526,6 +493,23 @@ def render_caption_image(lines, fontsize, emoji_cache):
     return img
 
 
+MAX_VIDEO_DIMENSION = 1080
+
+
+def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
+    if max(width, height) <= max_dim:
+        new_w, new_h = width, height
+    elif width >= height:
+        new_w = max_dim
+        new_h = int(height * max_dim / width)
+    else:
+        new_h = max_dim
+        new_w = int(width * max_dim / height)
+    new_w -= new_w % 2
+    new_h -= new_h % 2
+    return max(new_w, 2), max(new_h, 2)
+
+
 def compress_video(local_in, local_out):
     width, height = get_video_dimensions(local_in)
     target_w, target_h = compute_capped_dimensions(width, height)
@@ -697,7 +681,20 @@ def is_priority_unit(unit):
     return any(PRIORITY_PATTERN.search(video["name"]) for video in unit)
 
 
+ALLOWED_UTC_HOUR_WINDOWS = [(4, 9), (16, 21)]
+
+
+def is_within_allowed_window():
+    from datetime import datetime, timezone
+    hour = datetime.now(timezone.utc).hour
+    return any(start <= hour <= end for start, end in ALLOWED_UTC_HOUR_WINDOWS)
+
+
 def main():
+    if not is_within_allowed_window():
+        print("Van dozvoljenog vremenskog prozora za objavljivanje -- preskacem ovo pokretanje.")
+        return
+
     access_token = os.environ["IG_ACCESS_TOKEN"]
     ig_user_id = os.environ["IG_ACCOUNT_ID"]
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
