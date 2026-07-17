@@ -26,9 +26,13 @@ rotacije se cuva u state.json).
 
 Fajlovi cije ime sadrzi rec "prioritet" se tretiraju kao viralni klipovi:
 pojavljuju se cesce (svaka treca objava je "bonus" prioritetni klip). Na
-njih se NIKAD ne stavlja tekst preko videa -- ali se I DALJE kompresuju
-(bez teksta) da bi bili dovoljno mali za Cloudinary (sirovi video sa
-telefona je cesto prevelik i biva odbijen sa "413" greskom).
+njih se NIKAD ne stavlja tekst preko videa -- ali se I DALJE kompresuju.
+
+SVI video izlazi (obicni, prioritetni, spojeni) se automatski smanjuju na
+najvise 1080px (veca strana) -- ovo je kljucno jer izvorni video sa
+telefona (posebno 4K snimci) moze biti ogroman cak i posle kompresije
+kvaliteta; smanjenje rezolucije to pouzdano resava (413 "prevelik fajl"
+greska na Cloudinary-ju).
 
 Svi mrezni pozivi (Google Drive, Cloudinary, Instagram API) automatski
 pokusavaju ponovo (uz sve duzu pauzu) ako naidju na privremenu gresku, pre
@@ -323,11 +327,34 @@ def get_local_path(drive, video, target_path):
         download_file(drive, video["id"], target_path)
 
 
+MAX_VIDEO_DIMENSION = 1080
+
+
+def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
+    """Smanjuje rezoluciju (cuvajuci proporcije) ako je veca strana preko
+    max_dim -- ovo je kljucno za velicinu fajla: sam CRF (kvalitet) ne
+    pomaze mnogo ako je izvorni video u 4K ili slicnoj visokoj rezoluciji,
+    fajl ostaje ogroman. Vraca dimenzije zaokruzene na paran broj (potrebno
+    za video kodek)."""
+    if max(width, height) <= max_dim:
+        new_w, new_h = width, height
+    elif width >= height:
+        new_w = max_dim
+        new_h = int(height * max_dim / width)
+    else:
+        new_h = max_dim
+        new_w = int(width * max_dim / height)
+    new_w -= new_w % 2
+    new_h -= new_h % 2
+    return max(new_w, 2), max(new_h, 2)
+
+
 def concatenate_clips(local_paths, durations, output_path):
     """Spaja vise kratkih klipova u jedan video, CUVAJUCI zvuk svakog
     klipa. Ako neki klip nema audio traku, dodaje mu se tiha traka iste
     duzine (inace spajanje video+audio streamova ne bi bilo moguce)."""
     target_w, target_h = get_video_dimensions(local_paths[0])
+    target_w, target_h = compute_capped_dimensions(target_w, target_h)
 
     inputs = []
     for path in local_paths:
@@ -373,6 +400,7 @@ def concatenate_clips(local_paths, durations, output_path):
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-maxrate", "4M", "-bufsize", "8M",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
@@ -526,12 +554,16 @@ def render_caption_image(lines, fontsize, emoji_cache):
 
 def compress_video(local_in, local_out):
     """Samo kompresuje video (bez ikakvog teksta preko njega) -- koristi
-    se za prioritetne klipove, jer sirovi video sa telefona cesto bude
-    prevelik za Cloudinary (preko limita, 413 greska)."""
+    se za prioritetne klipove. Smanjuje i rezoluciju na max 1080px (veca
+    strana) da bi fajl sigurno bio ispod Cloudinary limita."""
+    width, height = get_video_dimensions(local_in)
+    target_w, target_h = compute_capped_dimensions(width, height)
     cmd = [
         "ffmpeg", "-y",
         "-i", local_in,
+        "-vf", f"scale={target_w}:{target_h}",
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-maxrate", "4M", "-bufsize", "8M",
         "-c:a", "aac", "-b:a", "128k",
         local_out,
     ]
@@ -540,10 +572,11 @@ def compress_video(local_in, local_out):
 
 
 def add_text_overlay(local_in, local_out, width, height, top_original, bottom_original):
+    target_w, target_h = compute_capped_dimensions(width, height)
     emoji_cache = {}
 
-    top_lines, top_size = fit_tokens(top_original, width, max_lines=2)
-    bottom_lines, bottom_size = fit_tokens(bottom_original, width, max_lines=1)
+    top_lines, top_size = fit_tokens(top_original, target_w, max_lines=2)
+    bottom_lines, bottom_size = fit_tokens(bottom_original, target_w, max_lines=1)
 
     top_img = render_caption_image(top_lines, top_size, emoji_cache)
     bottom_img = render_caption_image(bottom_lines, bottom_size, emoji_cache)
@@ -553,11 +586,12 @@ def add_text_overlay(local_in, local_out, width, height, top_original, bottom_or
     top_img.save(top_path)
     bottom_img.save(bottom_path)
 
-    top_y = int(height * TOP_TEXT_Y_FRACTION)
-    bottom_y = int(height * BOTTOM_TEXT_Y_FRACTION)
+    top_y = int(target_h * TOP_TEXT_Y_FRACTION)
+    bottom_y = int(target_h * BOTTOM_TEXT_Y_FRACTION)
 
     filter_complex = (
-        f"[0:v][1:v]overlay=(W-w)/2:{top_y}[tmp1];"
+        f"[0:v]scale={target_w}:{target_h}[base];"
+        f"[base][1:v]overlay=(W-w)/2:{top_y}[tmp1];"
         f"[tmp1][2:v]overlay=(W-w)/2:{bottom_y}"
     )
 
@@ -568,7 +602,8 @@ def add_text_overlay(local_in, local_out, width, height, top_original, bottom_or
         "-i", bottom_path,
         "-filter_complex", filter_complex,
         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
-        "-c:a", "copy",
+        "-maxrate", "4M", "-bufsize", "8M",
+        "-c:a", "aac", "-b:a", "128k",
         local_out,
     ]
     print("Pokrecem ffmpeg:", " ".join(cmd))
