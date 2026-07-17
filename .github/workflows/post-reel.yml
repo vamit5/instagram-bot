@@ -3,20 +3,15 @@ name: Objavi Instagram Reel
 # SVI termini su u UTC. Srbija je leti (CEST) UTC+2, zimi (CET) UTC+1.
 # Ovaj raspored je napravljen za LETNJE vreme (trenutno vazi).
 #
-# Umesto 40 pojedinacnih linija (koje je GitHub povremeno "gubio" pod
-# opterecenjem), koristimo standardni, kompaktan format: "svaki 18. minut,
-# u ovom opsegu sati" -- ovo GitHub pouzdanije izvrsava.
+# Umesto pojedinacnih linija, koristimo standardni, kompaktan format:
+# "svaki 18. minut, u ovom opsegu sati" -- GitHub ovo pouzdanije izvrsava.
 #
 # JUTARNJI BLOK: UTC 04:00-09:54 = srpsko vreme 06:00-11:54 (~24 objave)
 # VECERNJI BLOK: UTC 16:00-21:54 = srpsko vreme 18:00-23:54 (~24 objave)
-#
-# (Malo vise od 20 po bloku jer ravnomeran raspon sati daje 24, ali je
-# MNOGO pouzdaniji format -- javi Claude-u ako zelis tacno 20.)
 
-# Sprecava da se dva pokretanja izvrsavaju istovremeno (npr. rasporedjeno
-# + rucno testiranje u isto vreme) -- cekaju red umesto da se sudare pri
-# cuvanju state.json. Ovo takodje sprecava da se isti video slucajno
-# objavi dvaput zaredom.
+# Sprecava da se dva pokretanja izvrsavaju istovremeno -- cekaju red umesto
+# da se sudare pri cuvanju state.json. Ovo takodje sprecava da se isti
+# video slucajno objavi dvaput zaredom.
 concurrency:
   group: post-reel
   cancel-in-progress: false
@@ -59,8 +54,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git rebase origin/main
           git add state.json
           git commit -m "Update posting state [skip ci]" || echo "Nema promena"
+          git fetch origin main
+          git rebase origin/main
           git push
