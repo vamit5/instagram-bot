@@ -3,24 +3,21 @@ name: Objavi Instagram Reel
 # SVI termini su u UTC. Srbija je leti (CEST) UTC+2, zimi (CET) UTC+1.
 # Ovaj raspored je napravljen za LETNJE vreme (trenutno vazi).
 #
-# Umesto pojedinacnih linija, koristimo standardni, kompaktan format:
-# "svaki 18. minut, u ovom opsegu sati" -- GitHub ovo pouzdanije izvrsava.
-#
 # JUTARNJI BLOK: UTC 04:00-09:54 = srpsko vreme 06:00-11:54 (~24 objave)
 # VECERNJI BLOK: UTC 16:00-21:54 = srpsko vreme 18:00-23:54 (~24 objave)
-
-# Sprecava da se dva pokretanja izvrsavaju istovremeno -- cekaju red umesto
-# da se sudare pri cuvanju state.json. Ovo takodje sprecava da se isti
-# video slucajno objavi dvaput zaredom.
-concurrency:
-  group: post-reel
-  cancel-in-progress: false
+#
+# NAPOMENA: ovaj raspored moze biti nepouzdan (GitHub dokumentovano kasni
+# ili preskace zakazana pokretanja pod opterecenjem). Ako se koristi
+# spoljasnji servis (npr. cron-job.org) koji direktno zove workflow_dispatch,
+# skripta (instagram_post.py) sama proverava da li je "pravo vreme" preko
+# ALLOWED_UTC_HOUR_WINDOWS i tiho preskace van tih sati -- pa je bezbedno
+# da spoljasnji servis zove ovo i cesce/van ovih okvira.
 
 on:
   schedule:
     - cron: "*/18 4-9 * * *"    # jutro: 06:00-11:54 po srpskom vremenu
     - cron: "*/18 16-21 * * *"  # vece: 18:00-23:54 po srpskom vremenu
-  workflow_dispatch: {}  # dozvoljava i rucno pokretanje sa GitHub sajta, za testiranje
+  workflow_dispatch: {}  # dozvoljava i rucno/spoljasnje pokretanje
 
 jobs:
   post:
@@ -56,6 +53,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
           git commit -m "Update posting state [skip ci]" || echo "Nema promena"
-          git fetch origin main
-          git rebase origin/main
-          git push
+
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main && git push && break
+            echo "Push nije uspeo (pokusaj $i/5), pokusavam ponovo za 5s..."
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
