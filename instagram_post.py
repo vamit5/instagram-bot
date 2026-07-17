@@ -25,18 +25,16 @@ ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
 rotacije se cuva u state.json).
 
 Fajlovi cije ime sadrzi rec "prioritet" se tretiraju kao viralni klipovi:
-pojavljuju se cesce (svaka treca objava je "bonus" prioritetni klip). Na
-njih se NIKAD ne stavlja tekst preko videa -- ali se I DALJE kompresuju.
+pojavljuju se cesce, i na njih se NIKAD ne stavlja tekst preko videa (ali
+se i dalje kompresuju).
 
-SVI video izlazi (obicni, prioritetni, spojeni) se automatski smanjuju na
-najvise 1080px (veca strana) -- ovo je kljucno jer izvorni video sa
-telefona (posebno 4K snimci) moze biti ogroman cak i posle kompresije
-kvaliteta; smanjenje rezolucije to pouzdano resava (413 "prevelik fajl"
-greska na Cloudinary-ju).
+SVI video izlazi se automatski smanjuju na najvise 1080px (veca strana) --
+sprecava da veliki (npr. 4K) izvorni video bude odbijen kao "prevelik".
 
-Svi mrezni pozivi (Google Drive, Cloudinary, Instagram API) automatski
-pokusavaju ponovo (uz sve duzu pauzu) ako naidju na privremenu gresku, pre
-nego sto stvarno odustanu.
+Trajne (4xx) HTTP greske se NE pokusavaju ponovo (ponavljanje ne bi
+pomoglo), sto skripti stedi vreme i sprecava da se zakazana pokretanja
+preklapaju. Privremene (mrezne, 5xx) greske se ponavljaju sa sve duzom
+pauzom.
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -77,7 +75,6 @@ TEXT_COLOR = (255, 255, 255, 255)
 LINE_HEIGHT_FACTOR = 1.35
 MAX_TEXT_WIDTH_FRACTION = 0.86
 
-# Kratki klipovi (u sekundama) se spajaju dok zbir ne dostigne ovoliko.
 SHORT_CLIP_THRESHOLD = 9.0
 MIN_COMBINED_DURATION = 15.0
 
@@ -109,17 +106,9 @@ RULE_TEXT = (
     "grudi do dole, ruke se ispružaju maksimalno, nedozvoljeno je ići na kolena."
 )
 
-# Fajlovi cije ime sadrzi ovu rec (bilo gde, velika/mala slova nebitno) se
-# tretiraju kao "prioritetni" (viralni) klipovi: (1) svaka PRIORITY_BOOST_EVERY-ta
-# objava je "bonus" -- preskace se normalan redosled i ubaci se prioritetan
-# klip (rotirajuci i medju njima), i (2) na te klipove se NIKAD ne stavlja
-# tekst preko videa (samo opis ispod objave ostaje normalan).
 PRIORITY_PATTERN = re.compile(r"prioritet", re.IGNORECASE)
 PRIORITY_BOOST_EVERY = 3
 
-# Koliko puta da se pokusa ponovo (uz pauzu koja se svaki put duplira) pre
-# nego sto se stvarno odustane od mreznog poziva -- ovo pokriva velecinu
-# povremenih, prolaznih gresaka (Drive, Cloudinary, Instagram API).
 RETRY_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
 
@@ -129,6 +118,22 @@ def with_retry(func, *args, retries=RETRY_ATTEMPTS, delay=RETRY_BASE_DELAY, **kw
     while True:
         try:
             return func(*args, **kwargs)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and 400 <= status < 500:
+                # Trajna greska (npr. 413 "fajl prevelik") -- ponavljanje
+                # NIKAD nece uspeti, pa odmah odustajemo umesto da trosimo
+                # vreme (i time rizikujemo da se sledeci zakazani termin
+                # preklopi sa ovim koji predugo traje).
+                print(f"Trajna greska (HTTP {status}) -- ne pokusavam ponovo: {e}")
+                raise
+            attempt += 1
+            if attempt >= retries:
+                print(f"Odustajem posle {attempt} pokusaja: {e}")
+                raise
+            wait = delay * (2 ** (attempt - 1))
+            print(f"Greska ({e}) -- pokusaj {attempt}/{retries}, cekam {wait}s...")
+            time.sleep(wait)
         except Exception as e:
             attempt += 1
             if attempt >= retries:
@@ -149,8 +154,6 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
-    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja,
-    zajedno sa trajanjem (ako ga je Google Drive vec izracunao)."""
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
@@ -224,11 +227,6 @@ def has_audio_stream(local_path):
 
 
 def ensure_durations(drive, videos):
-    """Za svaki video kome Drive JOS NIJE izracunao trajanje (cesto kod
-    netom otpremljenih fajlova), skripta ga sama preuzme i izmeri stvarno
-    trajanje preko ffprobe. Preuzeti fajl se cuva (u video['_probed_path'])
-    da se ne bi preuzimao dvaput ako bas taj video bude izabran za objavu
-    u ovom pokretanju."""
     for video in videos:
         meta = video.get("videoMediaMetadata", {})
         ms = meta.get("durationMillis")
@@ -248,13 +246,6 @@ def ensure_durations(drive, videos):
 
 
 def build_playlist(videos):
-    """Pravi listu 'jedinica za objavu'. Video kraci od SHORT_CLIP_THRESHOLD
-    sekundi se sakuplja u zajednicku 'korpu' -- BEZ OBZIRA da li se izmedju
-    kratkih klipova nalaze duzi videi (duzi videi se odmah dodaju u listu
-    pojedinacno, ali ne prekidaju sakupljanje kratkih klipova u pozadini).
-    Cim zbir kratkih klipova dostigne MIN_COMBINED_DURATION sekundi, oni se
-    spajaju u jednu objavu. Ovo garantuje da kratak klip NIKAD ne ostane
-    usamljen samo zato sto je izmedju dva duga videa na Drive-u."""
     playlist = []
     buffer = []
     buffer_duration = 0.0
@@ -280,8 +271,6 @@ def build_playlist(videos):
 
 
 def get_video_dimensions(local_path):
-    """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
-    rotacione metapodatke koje telefoni cesto upisuju."""
     def call():
         result = subprocess.run(
             [
@@ -318,8 +307,6 @@ def get_video_dimensions(local_path):
 
 
 def get_local_path(drive, video, target_path):
-    """Ako je video vec preuzet tokom merenja trajanja (ensure_durations),
-    samo ga premesti na ciljnu putanju umesto ponovnog preuzimanja."""
     probed_path = video.get("_probed_path")
     if probed_path and os.path.exists(probed_path):
         os.replace(probed_path, target_path)
@@ -331,11 +318,6 @@ MAX_VIDEO_DIMENSION = 1080
 
 
 def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
-    """Smanjuje rezoluciju (cuvajuci proporcije) ako je veca strana preko
-    max_dim -- ovo je kljucno za velicinu fajla: sam CRF (kvalitet) ne
-    pomaze mnogo ako je izvorni video u 4K ili slicnoj visokoj rezoluciji,
-    fajl ostaje ogroman. Vraca dimenzije zaokruzene na paran broj (potrebno
-    za video kodek)."""
     if max(width, height) <= max_dim:
         new_w, new_h = width, height
     elif width >= height:
@@ -350,9 +332,6 @@ def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
 
 
 def concatenate_clips(local_paths, durations, output_path):
-    """Spaja vise kratkih klipova u jedan video, CUVAJUCI zvuk svakog
-    klipa. Ako neki klip nema audio traku, dodaje mu se tiha traka iste
-    duzine (inace spajanje video+audio streamova ne bi bilo moguce)."""
     target_w, target_h = get_video_dimensions(local_paths[0])
     target_w, target_h = compute_capped_dimensions(target_w, target_h)
 
@@ -421,8 +400,6 @@ EMOJI_PATTERN = re.compile(
 
 
 def tokenize(text):
-    """Deli tekst na 'reci' i 'emoji grupe', cuvajuci redosled, da bi
-    moglo da se meri i prelama red po red uzimajuci u obzir oboje."""
     tokens = []
     pos = 0
     for m in EMOJI_PATTERN.finditer(text):
@@ -486,9 +463,6 @@ def fit_tokens(text, video_width, max_lines):
             return lines, fontsize
         fontsize -= 2
 
-    # Ako ni na najmanjoj velicini ne stane u trazeni broj redova, NIKAD ne
-    # brisemo reci -- vracamo SVE redove (makar bilo vise redova nego sto
-    # je trazeno). Bolje veci natpis nego odsecen tekst.
     font = ImageFont.truetype(FONT_PATH, FONT_MIN_SIZE)
     lines = wrap_tokens(tokens, font, FONT_MIN_SIZE, max_width_px)
     return lines, FONT_MIN_SIZE
@@ -553,9 +527,6 @@ def render_caption_image(lines, fontsize, emoji_cache):
 
 
 def compress_video(local_in, local_out):
-    """Samo kompresuje video (bez ikakvog teksta preko njega) -- koristi
-    se za prioritetne klipove. Smanjuje i rezoluciju na max 1080px (veca
-    strana) da bi fajl sigurno bio ispod Cloudinary limita."""
     width, height = get_video_dimensions(local_in)
     target_w, target_h = compute_capped_dimensions(width, height)
     cmd = [
@@ -649,11 +620,6 @@ def save_state(state):
 
 
 def pick_next_text(state, key, options):
-    """Bira sledeci tekst iz liste tako da se NIKAD ne ponovi dok se ne
-    iskoriste svi ostali iz liste bar jednom (tzv. 'shuffled bag'
-    pristup). Kad se lista potrosi, pravi se nova, nasumicno promesana
-    runda -- vodi se racuna da se ne ponovi tekst sa kraja prethodne
-    runde odmah na pocetku nove."""
     queue_key = f"{key}_queue"
     last_key = f"{key}_last"
 
