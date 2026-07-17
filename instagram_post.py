@@ -25,8 +25,10 @@ ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
 rotacije se cuva u state.json).
 
 Fajlovi cije ime sadrzi rec "prioritet" se tretiraju kao viralni klipovi:
-pojavljuju se cesce (svaka treca objava je "bonus" prioritetni klip) i na
-njih se NIKAD ne stavlja tekst preko videa.
+pojavljuju se cesce (svaka treca objava je "bonus" prioritetni klip). Na
+njih se NIKAD ne stavlja tekst preko videa -- ali se I DALJE kompresuju
+(bez teksta) da bi bili dovoljno mali za Cloudinary (sirovi video sa
+telefona je cesto prevelik i biva odbijen sa "413" greskom).
 
 Svi mrezni pozivi (Google Drive, Cloudinary, Instagram API) automatski
 pokusavaju ponovo (uz sve duzu pauzu) ako naidju na privremenu gresku, pre
@@ -522,6 +524,21 @@ def render_caption_image(lines, fontsize, emoji_cache):
     return img
 
 
+def compress_video(local_in, local_out):
+    """Samo kompresuje video (bez ikakvog teksta preko njega) -- koristi
+    se za prioritetne klipove, jer sirovi video sa telefona cesto bude
+    prevelik za Cloudinary (preko limita, 413 greska)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", local_in,
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
+        local_out,
+    ]
+    print("Kompresujem prioritetan klip (bez teksta):", " ".join(cmd))
+    with_retry(subprocess.run, cmd, retries=2, delay=3, check=True)
+
+
 def add_text_overlay(local_in, local_out, width, height, top_original, bottom_original):
     emoji_cache = {}
 
@@ -735,7 +752,9 @@ def main():
         print(f"Spojeno {len(unit)} kratkih klipova u jedan video: {[v['name'] for v in unit]}")
 
     if priority:
-        video_to_upload = local_in
+        local_out = "kompresovan.mp4"
+        compress_video(local_in, local_out)
+        video_to_upload = local_out
     else:
         local_out = "sa_tekstom.mp4"
         width, height = get_video_dimensions(local_in)
