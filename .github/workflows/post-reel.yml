@@ -6,12 +6,13 @@ name: Objavi Instagram Reel
 # JUTARNJI BLOK: UTC 04:00-09:54 = srpsko vreme 06:00-11:54 (~24 objave)
 # VECERNJI BLOK: UTC 16:00-21:54 = srpsko vreme 18:00-23:54 (~24 objave)
 #
-# NAPOMENA: ovaj raspored moze biti nepouzdan (GitHub dokumentovano kasni
-# ili preskace zakazana pokretanja pod opterecenjem). Ako se koristi
-# spoljasnji servis (npr. cron-job.org) koji direktno zove workflow_dispatch,
-# skripta (instagram_post.py) sama proverava da li je "pravo vreme" preko
-# ALLOWED_UTC_HOUR_WINDOWS i tiho preskace van tih sati -- pa je bezbedno
-# da spoljasnji servis zove ovo i cesce/van ovih okvira.
+# NAPOMENA: koristi se i GitHub-ov interni raspored I spoljasnji
+# cron-job.org servis (koji zove workflow_dispatch cesto, ceo dan) --
+# ovo znaci da se ISTI workflow moze pokrenuti dva puta skoro
+# istovremeno. Zato prvi korak ("Zauzmi lock") sluzi kao "katanac":
+# samo JEDNO pokretanje sme da nastavi, sva ostala koja naidju na vec
+# zakljucan katanac se TIHO preskacu (bez greske, bez otkazivanja) --
+# ovo sprecava da se isti video objavi dvaput.
 
 on:
   schedule:
@@ -28,18 +29,59 @@ jobs:
       - name: Preuzmi repozitorijum
         uses: actions/checkout@v4
 
+      - name: Zauzmi lock (sprecava duple objave)
+        id: lock
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          NOW=$(date +%s)
+          LOCK_MAX_AGE=480
+
+          LOCK_TIME=0
+          if [ -f lock.txt ]; then
+            LOCK_TIME=$(cat lock.txt 2>/dev/null || echo 0)
+          fi
+          case "$LOCK_TIME" in
+            ''|*[!0-9]*) LOCK_TIME=0 ;;
+          esac
+
+          AGE=$((NOW - LOCK_TIME))
+
+          if [ "$AGE" -lt "$LOCK_MAX_AGE" ]; then
+            echo "Lock je svez (star $AGE s) -- neko drugo pokretanje vec radi, preskacem ovo pokretanje."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$NOW" > lock.txt
+          git add lock.txt
+          git commit -m "Claim lock [skip ci]"
+
+          if git push; then
+            echo "Lock uspesno zauzet, nastavljam sa objavljivanjem."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Neko drugi je zauzeo lock u medjuvremenu, preskacem ovo pokretanje."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Podesi Python
+        if: steps.lock.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Instaliraj ffmpeg i fontove
+        if: steps.lock.outputs.should_run == 'true'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
 
       - name: Instaliraj biblioteke
+        if: steps.lock.outputs.should_run == 'true'
         run: pip install -r requirements.txt
 
       - name: Objavi sledeci video
+        if: steps.lock.outputs.should_run == 'true'
         env:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_ACCOUNT_ID: ${{ secrets.IG_ACCOUNT_ID }}
@@ -48,6 +90,7 @@ jobs:
         run: python instagram_post.py
 
       - name: Sacuvaj napredak (state.json)
+        if: steps.lock.outputs.should_run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
