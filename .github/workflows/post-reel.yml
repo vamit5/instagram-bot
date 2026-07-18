@@ -12,7 +12,10 @@ name: Objavi Instagram Reel
 # istovremeno. Zato prvi korak ("Zauzmi lock") sluzi kao "katanac":
 # samo JEDNO pokretanje sme da nastavi, sva ostala koja naidju na vec
 # zakljucan katanac se TIHO preskacu (bez greske, bez otkazivanja) --
-# ovo sprecava da se isti video objavi dvaput.
+# ovo sprecava da se isti video objavi dvaput. Katanac traje 25 minuta
+# (neka pokretanja, kad Instagram sporo obradjuje video, mogu potrajati
+# i 20+ minuta -- katanac MORA trajati duze od najsporijeg mogueg
+# pokretanja, inace se pogresno "otkljuca" na pola posla).
 
 on:
   schedule:
@@ -36,7 +39,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           NOW=$(date +%s)
-          LOCK_MAX_AGE=480
+          LOCK_MAX_AGE=1500
 
           LOCK_TIME=0
           if [ -f lock.txt ]; then
