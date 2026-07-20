@@ -6,16 +6,16 @@ name: Objavi Instagram Reel
 # JUTARNJI BLOK: UTC 04:00-09:54 = srpsko vreme 06:00-11:54 (~24 objave)
 # VECERNJI BLOK: UTC 16:00-21:54 = srpsko vreme 18:00-23:54 (~24 objave)
 #
-# NAPOMENA: koristi se i GitHub-ov interni raspored I spoljasnji
-# cron-job.org servis (koji zove workflow_dispatch cesto, ceo dan) --
-# ovo znaci da se ISTI workflow moze pokrenuti dva puta skoro
-# istovremeno. Zato prvi korak ("Zauzmi lock") sluzi kao "katanac":
-# samo JEDNO pokretanje sme da nastavi, sva ostala koja naidju na vec
-# zakljucan katanac se TIHO preskacu (bez greske, bez otkazivanja) --
-# ovo sprecava da se isti video objavi dvaput. Katanac traje 25 minuta
-# (neka pokretanja, kad Instagram sporo obradjuje video, mogu potrajati
-# i 20+ minuta -- katanac MORA trajati duze od najsporijeg mogueg
-# pokretanja, inace se pogresno "otkljuca" na pola posla).
+# NAPOMENA O KATANCU (lock.txt): koristi se i GitHub-ov interni raspored I
+# spoljasnji cron-job.org servis, pa se isti workflow moze pokrenuti dva
+# puta skoro istovremeno. Prvi korak ("Zauzmi lock") sluzi kao "katanac" --
+# samo JEDNO pokretanje sme da nastavi. NA KRAJU, poslednji korak
+# ("Otkljucaj lock") ODMAH oslobadja katanac cim se pokretanje zavrsi
+# (uspesno ili ne) -- ovo je KLJUCNO, jer bez toga bi katanac ostao
+# "zakljucan" jos 25 minuta i posle brzog, uspesnog pokretanja, blokirajuci
+# sledece termine bez razloga. 25-minutni limit (LOCK_MAX_AGE) je samo
+# rezervna zastita za redak slucaj da se pokretanje prekine na silu (npr.
+# GitHub ubije runner) pre nego sto stigne do koraka za otkljucavanje.
 
 on:
   schedule:
@@ -99,6 +99,23 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
           git commit -m "Update posting state [skip ci]" || echo "Nema promena"
+
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main && git push && break
+            echo "Push nije uspeo (pokusaj $i/5), pokusavam ponovo za 5s..."
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+
+      - name: Otkljucaj lock
+        if: always() && steps.lock.outputs.should_run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "0" > lock.txt
+          git add lock.txt
+          git commit -m "Release lock [skip ci]" || echo "Nema promena"
 
           for i in 1 2 3 4 5; do
             git fetch origin main
