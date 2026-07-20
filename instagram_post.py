@@ -777,6 +777,9 @@ def main():
 
     top_original = pick_next_text(state, "top", TOP_TEXTS)
     bottom_original = pick_next_text(state, "bottom", BOTTOM_TEXTS)
+    print(f"DEBUG - Gornji tekst: {top_original!r}")
+    print(f"DEBUG - Donji tekst: {bottom_original!r}")
+    print(f"DEBUG - Duzina TOP_TEXTS liste u ovom kodu: {len(TOP_TEXTS)}")
 
     priority = is_priority_unit(unit)
     if priority:
