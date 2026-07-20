@@ -22,7 +22,8 @@ NIKAD se ne brisu reci -- dodaje se jos redova umesto toga.
 
 Gornji i donji tekst se biraju iz "rotirajuce" liste -- isti tekst se NIKAD
 ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
-rotacije se cuva u state.json).
+rotacije se cuva u state.json). Ako se lista tekstova promeni u kodu, stari
+zapis u state.json se automatski odbacuje i pravi iznova (samo-popravka).
 
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
@@ -63,22 +64,20 @@ TEXT_COLOR = (255, 255, 255, 255)
 LINE_HEIGHT_FACTOR = 1.35
 MAX_TEXT_WIDTH_FRACTION = 0.86
 
+# Kratki klipovi (u sekundama) se spajaju dok zbir ne dostigne ovoliko.
 SHORT_CLIP_THRESHOLD = 9.0
 MIN_COMBINED_DURATION = 15.0
 
 TOP_TEXTS = [
-    "Da li ćeš preživeti ceo VAMIT-5 sat? 😱",
-    "99% ljudi ne uspe kompletan VAMIT-5 sat ❌",
-    "Napravi haos u društvu sa VAMIT-5 satom 🕐",
-    "VAMIT-5 sat napravio haos na Balkanu 😱🕐",
-    "Ljudi poludeli za VAMIT-5 satom 😱🕐",
-    "Najtraženiji fitnes proizvod u regiji 🕐😍",
+    "Da li ćeš preživeti ceo VAMIT-5 sat za 2 min? 😱",
+    "99% ljudi ne uspe kompletan VAMIT-5 sat za 2 min ❌",
     "Idealan proizvod za trenere i njegove klijente 😱",
-    "Napravi nezaboravnu žurku sa VAMIT-5 satom 🕐😍",
-    "Tvoje dete će se obradovati ovom satu 😍",
-    "Vreme je da pokloniš ovaj sat svom detetu 😍",
-    "Pokloni ovaj sat svom detetu, unuku i gledaj napade sreće 🕐😍",
-    "Tvoje dete te tajno moli da mu kupiš ovaj sat 🕐😍",
+    "Deca obožavaju VAMIT-5 sat 😍",
+    "Treneri, testirajte svoje klijente sa VAMIT-5 satom 🕐😍",
+    "Trener si i hoćeš da testiraš izdržljivost svojih klijenata?",
+    "Imaš sina kojem je stalno dosadno?",
+    "Tvoja deca su nemirna? Kupi im VAMIT-5 sat 😍",
+    "Trener si i hoćeš nešto drugačije da ponudiš?",
 ]
 
 BOTTOM_TEXTS = [
@@ -94,9 +93,17 @@ RULE_TEXT = (
     "grudi do dole, ruke se ispružaju maksimalno, nedozvoljeno je ići na kolena."
 )
 
+# Fajlovi cije ime sadrzi ovu rec (bilo gde, velika/mala slova nebitno) se
+# tretiraju kao "prioritetni" (viralni) klipovi: (1) svaka PRIORITY_BOOST_EVERY-ta
+# objava je "bonus" -- preskace se normalan redosled i ubaci se prioritetan
+# klip (rotirajuci i medju njima), i (2) na te klipove se NIKAD ne stavlja
+# tekst preko videa (samo opis ispod objave ostaje normalan).
 PRIORITY_PATTERN = re.compile(r"prioritet", re.IGNORECASE)
 PRIORITY_BOOST_EVERY = 3
 
+# Koliko puta da se pokusa ponovo (uz pauzu koja se svaki put duplira) pre
+# nego sto se stvarno odustane od mreznog poziva -- ovo pokriva velecinu
+# povremenih, prolaznih gresaka (Drive, Cloudinary, Instagram API).
 RETRY_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
 
@@ -138,6 +145,8 @@ def get_drive_service():
 
 
 def list_videos(service, folder_id):
+    """Vraca listu video fajlova u folderu, sortiranu po datumu dodavanja,
+    zajedno sa trajanjem (ako ga je Google Drive vec izracunao)."""
     query = (
         f"'{folder_id}' in parents and mimeType contains 'video/' and trashed=false"
     )
@@ -211,6 +220,11 @@ def has_audio_stream(local_path):
 
 
 def ensure_durations(drive, videos):
+    """Za svaki video kome Drive JOS NIJE izracunao trajanje (cesto kod
+    netom otpremljenih fajlova), skripta ga sama preuzme i izmeri stvarno
+    trajanje preko ffprobe. Preuzeti fajl se cuva (u video['_probed_path'])
+    da se ne bi preuzimao dvaput ako bas taj video bude izabran za objavu
+    u ovom pokretanju."""
     for video in videos:
         meta = video.get("videoMediaMetadata", {})
         ms = meta.get("durationMillis")
@@ -230,6 +244,13 @@ def ensure_durations(drive, videos):
 
 
 def build_playlist(videos):
+    """Pravi listu 'jedinica za objavu'. Video kraci od SHORT_CLIP_THRESHOLD
+    sekundi se sakuplja u zajednicku 'korpu' -- BEZ OBZIRA da li se izmedju
+    kratkih klipova nalaze duzi videi (duzi videi se odmah dodaju u listu
+    pojedinacno, ali ne prekidaju sakupljanje kratkih klipova u pozadini).
+    Cim zbir kratkih klipova dostigne MIN_COMBINED_DURATION sekundi, oni se
+    spajaju u jednu objavu. Ovo garantuje da kratak klip NIKAD ne ostane
+    usamljen samo zato sto je izmedju dva duga videa na Drive-u."""
     playlist = []
     buffer = []
     buffer_duration = 0.0
@@ -255,6 +276,8 @@ def build_playlist(videos):
 
 
 def get_video_dimensions(local_path):
+    """Vraca STVARNE (prikazane) dimenzije videa, uzimajuci u obzir
+    rotacione metapodatke koje telefoni cesto upisuju."""
     def call():
         result = subprocess.run(
             [
@@ -291,6 +314,8 @@ def get_video_dimensions(local_path):
 
 
 def get_local_path(drive, video, target_path):
+    """Ako je video vec preuzet tokom merenja trajanja (ensure_durations),
+    samo ga premesti na ciljnu putanju umesto ponovnog preuzimanja."""
     probed_path = video.get("_probed_path")
     if probed_path and os.path.exists(probed_path):
         os.replace(probed_path, target_path)
@@ -299,6 +324,9 @@ def get_local_path(drive, video, target_path):
 
 
 def concatenate_clips(local_paths, durations, output_path):
+    """Spaja vise kratkih klipova u jedan video, CUVAJUCI zvuk svakog
+    klipa. Ako neki klip nema audio traku, dodaje mu se tiha traka iste
+    duzine (inace spajanje video+audio streamova ne bi bilo moguce)."""
     target_w, target_h = get_video_dimensions(local_paths[0])
     target_w, target_h = compute_capped_dimensions(target_w, target_h)
 
@@ -367,6 +395,8 @@ EMOJI_PATTERN = re.compile(
 
 
 def tokenize(text):
+    """Deli tekst na 'reci' i 'emoji grupe', cuvajuci redosled, da bi
+    moglo da se meri i prelama red po red uzimajuci u obzir oboje."""
     tokens = []
     pos = 0
     for m in EMOJI_PATTERN.finditer(text):
@@ -497,6 +527,11 @@ MAX_VIDEO_DIMENSION = 1080
 
 
 def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
+    """Smanjuje rezoluciju (cuvajuci proporcije) ako je veca strana preko
+    max_dim -- ovo je kljucno za velicinu fajla: sam CRF (kvalitet) ne
+    pomaze mnogo ako je izvorni video u 4K ili slicnoj visokoj rezoluciji,
+    fajl ostaje ogroman. Vraca dimenzije zaokruzene na paran broj (potrebno
+    za video kodek)."""
     if max(width, height) <= max_dim:
         new_w, new_h = width, height
     elif width >= height:
@@ -511,6 +546,9 @@ def compute_capped_dimensions(width, height, max_dim=MAX_VIDEO_DIMENSION):
 
 
 def compress_video(local_in, local_out):
+    """Samo kompresuje video (bez ikakvog teksta preko njega) -- koristi
+    se za prioritetne klipove. Smanjuje i rezoluciju na max 1080px (veca
+    strana) da bi fajl sigurno bio ispod Cloudinary limita."""
     width, height = get_video_dimensions(local_in)
     target_w, target_h = compute_capped_dimensions(width, height)
     cmd = [
@@ -604,11 +642,21 @@ def save_state(state):
 
 
 def pick_next_text(state, key, options):
+    """Bira sledeci tekst iz liste tako da se NIKAD ne ponovi dok se ne
+    iskoriste svi ostali iz liste bar jednom (tzv. 'shuffled bag'
+    pristup). Kad se lista potrosi, pravi se nova, nasumicno promesana
+    runda -- vodi se racuna da se ne ponovi tekst sa kraja prethodne
+    runde odmah na pocetku nove.
+
+    Ako se lista tekstova (TOP_TEXTS/BOTTOM_TEXTS) promeni u kodu (dodaju
+    se/uklone tekstovi), stari sacuvani indeksi u state.json vise ne bi
+    odgovarali tacnim tekstovima -- zato se queue AUTOMATSKI odbacuje i
+    napravi iznova ako sadrzi bilo koji indeks van opsega trenutne liste."""
     queue_key = f"{key}_queue"
     last_key = f"{key}_last"
 
     queue = state.get(queue_key, [])
-    if not queue:
+    if not queue or any(i >= len(options) for i in queue):
         queue = list(range(len(options)))
         random.shuffle(queue)
         last = state.get(last_key)
