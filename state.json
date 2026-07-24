@@ -1,16 +1,13 @@
 {
-  "last_index": 2,
-  "top_queue": [
-    5
-  ],
-  "top_last": 7,
+  "last_index": 3,
+  "top_queue": [],
+  "top_last": 5,
   "bottom_queue": [
-    3,
     1,
     4,
     2
   ],
-  "bottom_last": 0,
-  "run_counter": 271,
+  "bottom_last": 3,
+  "run_counter": 272,
   "priority_index": 5
 }
