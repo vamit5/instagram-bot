@@ -69,15 +69,13 @@ SHORT_CLIP_THRESHOLD = 9.0
 MIN_COMBINED_DURATION = 15.0
 
 TOP_TEXTS = [
-    "Da li ćeš preživeti ceo VAMIT-5 sat za 2 min? 😱",
-    "99% ljudi ne uspe kompletan VAMIT-5 sat za 2 min ❌",
-    "Idealan proizvod za trenere i njegove klijente 😱",
-    "Deca obožavaju VAMIT-5 sat 😍",
-    "Treneri, testirajte svoje klijente sa VAMIT-5 satom 🕐😍",
-    "Trener si i hoćeš da testiraš izdržljivost svojih klijenata?",
-    "Imaš sina kojem je stalno dosadno?",
-    "Tvoja deca su nemirna? Kupi im VAMIT-5 sat 😍",
-    "Trener si i hoćeš nešto drugačije da ponudiš?",
+    "Da li ćeš preživeti ceo VAMIT-5 sat?",
+    "99% ljudi ne uspe kompletan VAMIT-5 sat",
+    "Da li ćeš uspeti ceo sat za 2 minuta?",
+    "90% ljudi padne na broju 8",
+    "Do kog broja bi ti stigao?",
+    "Savršen proizvod za trenere",
+    "Savršen proizvod za nemirnu decu",
 ]
 
 BOTTOM_TEXTS = [
@@ -460,6 +458,9 @@ def fit_tokens(text, video_width, max_lines):
             return lines, fontsize
         fontsize -= 2
 
+    # Ako ni na najmanjoj velicini ne stane u trazeni broj redova, NIKAD ne
+    # brisemo reci -- vracamo SVE redove (makar bilo vise redova nego sto
+    # je trazeno). Bolje veci natpis nego odsecen tekst.
     font = ImageFont.truetype(FONT_PATH, FONT_MIN_SIZE)
     lines = wrap_tokens(tokens, font, FONT_MIN_SIZE, max_width_px)
     return lines, FONT_MIN_SIZE
@@ -648,10 +649,10 @@ def pick_next_text(state, key, options):
     runda -- vodi se racuna da se ne ponovi tekst sa kraja prethodne
     runde odmah na pocetku nove.
 
-    Ako se lista tekstova (TOP_TEXTS/BOTTOM_TEXTS) promeni u kodu (dodaju
-    se/uklone tekstovi), stari sacuvani indeksi u state.json vise ne bi
-    odgovarali tacnim tekstovima -- zato se queue AUTOMATSKI odbacuje i
-    napravi iznova ako sadrzi bilo koji indeks van opsega trenutne liste."""
+    Ako se lista tekstova (TOP_TEXTS/BOTTOM_TEXTS) promeni u kodu, stari
+    sacuvani indeksi u state.json vise ne bi odgovarali tacnim tekstovima
+    -- zato se queue AUTOMATSKI odbacuje i pravi iznova ako sadrzi bilo
+    koji indeks van opsega trenutne liste."""
     queue_key = f"{key}_queue"
     last_key = f"{key}_last"
 
