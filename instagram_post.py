@@ -25,6 +25,12 @@ ne ponavlja dok se ne iskoriste svi ostali iz liste bar jednom (stanje te
 rotacije se cuva u state.json). Ako se lista tekstova promeni u kodu, stari
 zapis u state.json se automatski odbacuje i pravi iznova (samo-popravka).
 
+Pre svake objave, skripta proverava TACNU, TRENUTNU iskoriscenost
+Instagram publishing kvote za taj nalog -- ako je kvota vec skoro/potpuno
+potrosena, tiho preskace umesto da trosi vreme na preuzimanje/obradu
+videa koji bi na kraju svejedno pao na "Media Publish Limit Exceeded"
+gresci.
+
 Ne treba ovo pokretati rucno -- GitHub Actions to radi sam, po rasporedu.
 """
 
@@ -739,6 +745,29 @@ def is_within_allowed_window():
     return any(start <= hour <= end for start, end in ALLOWED_UTC_HOUR_WINDOWS)
 
 
+QUOTA_SAFETY_MARGIN = 1  # ostavi bar toliko slobodnih mesta kao sigurnosnu marginu
+
+
+def check_publishing_quota(ig_user_id, access_token):
+    """Proverava tacnu, TRENUTNU iskoriscenost Instagram publishing kvote
+    za ovaj konkretan nalog (Meta postavlja limit koji moze da varira po
+    nalogu, ne uvek isti fiksan broj). Ako provera ne uspe iz bilo kog
+    razloga, ne blokira pokretanje -- samo se nastavlja normalno."""
+    url = f"{API_BASE}/{GRAPH_VERSION}/{ig_user_id}/content_publishing_limit"
+    params = {"fields": "config,quota_usage", "access_token": access_token}
+
+    def call():
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    data = with_retry(call)
+    entry = data["data"][0]
+    usage = entry["quota_usage"]
+    total = entry["config"]["quota_total"]
+    return usage, total
+
+
 def main():
     if not is_within_allowed_window():
         print("Van dozvoljenog vremenskog prozora za objavljivanje -- preskacem ovo pokretanje.")
@@ -747,6 +776,15 @@ def main():
     access_token = os.environ["IG_ACCESS_TOKEN"]
     ig_user_id = os.environ["IG_ACCOUNT_ID"]
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
+
+    try:
+        usage, total = check_publishing_quota(ig_user_id, access_token)
+        print(f"Instagram publishing kvota: {usage}/{total} iskorisceno u poslednjih 24h.")
+        if usage >= total - QUOTA_SAFETY_MARGIN:
+            print("Kvota je skoro/potpuno potrosena -- preskacem ovo pokretanje da ne bih trosio resurse uzalud.")
+            return
+    except Exception as e:
+        print(f"Ne mogu da proverim kvotu ({e}) -- nastavljam normalno, pokusacu da objavim.")
 
     drive = get_drive_service()
     videos = list_videos(drive, folder_id)
